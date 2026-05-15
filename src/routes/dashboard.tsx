@@ -84,7 +84,7 @@ function DashboardPage() {
   const [mapMode, setMapMode] = useState<'IDLE' | 'TRACKING' | 'ROUTE' | 'NEARBY'>('IDLE');
   const { batteryLevel, isCharging } = useBattery();
   const { currentTelemetry, setCurrentTelemetry, gpsStatus, gpsActive, lastUpdated } = useTelemetry(user, sosActive, mapMode, batteryLevel);
-  const { guardians } = useGuardians(user, currentTelemetry);
+  const { guardians, loading: loadingGuardians } = useGuardians(user, currentTelemetry);
   const { responderCount } = useResponders(user);
   const mapState = useMap();
   const [isRecovering, setIsRecovering] = useState(true);
@@ -686,8 +686,6 @@ function DashboardPage() {
   // --- TRUSTED CIRCLE STATE ---
   const [isTrustedCircleOpen, setIsTrustedCircleOpen] = useState(false);
   const [isAddingContact, setIsAddingContact] = useState(false);
-  const [contacts, setContacts] = useState<any[]>([]);
-  const [isLoadingContacts, setIsLoadingContacts] = useState(false);
   const [isSavingContact, setIsSavingContact] = useState(false);
   const [deletingId, setDeletingId] = useState<string | null>(null);
 
@@ -1106,7 +1104,7 @@ function DashboardPage() {
     if (sosActive || isEscalationOpen) return 'High';
     const hour = new Date().getHours();
     const isLateNight = hour >= 22 || hour < 5;
-    if (isLateNight || (activeJourney && journeyTimeLeft !== null && journeyTimeLeft < 300) || contacts.length === 0 || routeRisk === 'HIGH' || gpsFailCount > 1) return 'Medium';
+    if (isLateNight || (activeJourney && journeyTimeLeft !== null && journeyTimeLeft < 300) || guardians.length === 0 || routeRisk === 'HIGH' || gpsFailCount > 1) return 'Medium';
     return 'Low';
   };
   const aiRiskLevel = determineRiskLevel();
@@ -1126,11 +1124,11 @@ function DashboardPage() {
     const hour = new Date().getHours();
     if (hour >= 22 || hour < 5) signals.push({ text: 'Late-night activity detected', severity: 'Medium' });
     if (activeJourney && journeyTimeLeft !== null && journeyTimeLeft < 300) signals.push({ text: 'Journey ETA expiring soon', severity: 'Medium' });
-    if (contacts.length === 0) signals.push({ text: 'Trusted contacts unavailable', severity: 'Medium' });
+    if (guardians.length === 0) signals.push({ text: 'Trusted contacts unavailable', severity: 'Medium' });
     if (routeRisk === 'HIGH' || routeRisk === 'MODERATE') signals.push({ text: 'Active unsafe route analysis', severity: routeRisk === 'HIGH' ? 'High' : 'Medium' });
     if (gpsFailCount > 1) signals.push({ text: 'Location telemetry unstable', severity: 'Medium' });
     return signals;
-  }, [sosActive, isEscalationOpen, activeJourney, journeyTimeLeft, contacts.length, routeRisk, gpsFailCount]);
+  }, [sosActive, isEscalationOpen, activeJourney, journeyTimeLeft, guardians.length, routeRisk, gpsFailCount]);
 
   const aiInsights = useMemo(() => {
     const insights = [];
@@ -1139,14 +1137,14 @@ function DashboardPage() {
       insights.push('Privacy-focused recording and GPS activated');
     } else if (aiRiskLevel === 'Medium') {
       insights.push('Maintain awareness of surroundings');
-      if (contacts.length === 0) insights.push('Add trusted contacts for safety backup');
+      if (guardians.length === 0) insights.push('Add trusted contacts for safety backup');
       if (activeJourney) insights.push('Check in to prevent auto-escalation');
     } else {
       insights.push('No unusual activity detected');
       insights.push('System armed and monitoring');
     }
     return insights;
-  }, [aiRiskLevel, contacts.length, activeJourney]);
+  }, [aiRiskLevel, guardians.length, activeJourney]);
 
   useEffect(() => {
     if (isAiThreatOpen) {
@@ -1161,33 +1159,7 @@ function DashboardPage() {
 
 
   // --- TRUSTED CIRCLE LOGIC ---
-  useEffect(() => {
-    if (!isTrustedCircleOpen || !user) return;
-    
-    setIsLoadingContacts(true);
-    logOperational('CONTACT_SYNC', `[FIRESTORE] Attaching contact listener for user: ${user.uid}`);
-    
-    const q = query(
-      collection(db, "trustedContacts"), 
-      where("userId", "==", user.uid),
-      orderBy("priority", "asc")
-    );
-    
-    const unsubscribe = onSnapshot(q, (snapshot) => {
-      const fetched = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-      setContacts(fetched);
-      setIsLoadingContacts(false);
-      logOperational('CONTACT_SYNC', `[FIRESTORE] Synchronized ${fetched.length} contacts`);
-    }, (error) => {
-      console.error("[FIRESTORE] [CONTACT_SYNC] Listener failed:", error);
-      setIsLoadingContacts(false);
-    });
-    
-    return () => {
-      unsubscribe();
-      logOperational('CONTACT_SYNC', '[FIRESTORE] Contact listener disposed');
-    };
-  }, [isTrustedCircleOpen, user?.uid]);
+  // Managed via useGuardians hook
 
   const handleSaveContact = async () => {
     // 1. Auth Guard
@@ -1214,7 +1186,7 @@ function DashboardPage() {
       return;
     }
 
-    if (contacts.length >= 5) {
+    if (guardians.length >= 5) {
       toast.error("Maximum 5 trusted contacts allowed");
       return;
     }
@@ -1228,12 +1200,13 @@ function DashboardPage() {
         userId: user.uid,
         name: newContact.name.trim(),
         phone: newContact.phone.trim(),
-        relationship: newContact.relationship,
+        type: newContact.relationship, // Map relationship to 'type' field used in useGuardians
         priority: Number(newContact.priority),
+        lastSeen: serverTimestamp(), // Initialize lastSeen for status logic
         createdAt: serverTimestamp()
       };
 
-      await addDoc(collection(db, "trustedContacts"), contactData);
+      await addDoc(collection(db, "users", user.uid, "guardians"), contactData);
       
       logOperational('FIRESTORE', 'Contact successfully persisted');
       toast.success("Trusted contact added successfully", { id: toastId });
@@ -1258,7 +1231,7 @@ function DashboardPage() {
     logOperational('CONTACT_SAVE', `Attempting to remove contact: ${id}`);
     
     try {
-      await deleteDoc(doc(db, "trustedContacts", id));
+      await deleteDoc(doc(db, "users", user.uid, "guardians", id));
       logOperational('FIRESTORE', 'Contact removal successful');
       toast.success("Contact removed");
     } catch (e: any) {
@@ -1779,7 +1752,7 @@ function DashboardPage() {
                 title="Trusted Circle" 
                 desc="Connected family & trusted contacts" 
                 icon={<Users />} 
-                active={contacts.length > 0} 
+                active={guardians.length > 0} 
                 onClick={openTrustedCircle} 
                 tapScale={motionProfile.tapScale}
                 pulseOpacity={motionProfile.pulseOpacity}
@@ -2418,12 +2391,12 @@ function DashboardPage() {
                     <Shield className="w-5 h-5 text-green-500" />
                   </div>
                   <div>
-                    <p className="text-sm text-silver font-medium">Protected by {contacts.length} {contacts.length === 1 ? 'contact' : 'contacts'}</p>
+                    <p className="text-sm text-silver font-medium">Protected by {guardians.length} {guardians.length === 1 ? 'contact' : 'contacts'}</p>
                     <p className="text-[10px] text-silver/40 uppercase tracking-widest mt-0.5">Emergency Network Active</p>
                   </div>
                 </div>
 
-                {!isAddingContact && contacts.length < 5 && (
+                {!isAddingContact && guardians.length < 5 && (
                   <button onClick={() => setIsAddingContact(true)} className="mb-6 w-full py-4 rounded-xl border border-dashed border-white/20 text-[11px] font-bold uppercase tracking-widest text-silver hover:border-white/40 hover:bg-white/5 transition-all flex items-center justify-center gap-2">
                     <Users className="w-4 h-4" />
                     Add Trusted Contact
@@ -2475,24 +2448,24 @@ function DashboardPage() {
                 )}
 
                 <div className="flex-1 overflow-y-auto space-y-3 pb-8">
-                  {isLoadingContacts ? (
+                  {loadingGuardians ? (
                     <div className="space-y-3 py-2">
                        <Skeleton className="w-full" height="72px" />
                        <Skeleton className="w-full" height="72px" />
                        <Skeleton className="w-full" height="72px" />
                     </div>
-                  ) : contacts.length === 0 ? (
+                  ) : guardians.length === 0 ? (
                     <div className="text-center py-10 border border-dashed border-white/5 rounded-2xl glass-panel bg-white/[0.01]">
                       <Users className="w-8 h-8 text-silver/20 mx-auto mb-3" />
                       <p className="text-xs text-silver/40 uppercase tracking-widest">No trusted contacts added yet</p>
                     </div>
                   ) : (
-                    contacts.map((contact) => (
+                    guardians.map((contact) => (
                       <div key={contact.id} className="glass-panel p-4 rounded-xl border-white/5 bg-black/40 hover:bg-white/[0.02] hover:border-white/10 transition-colors group relative flex items-center gap-4">
                         <IdentityAvatar 
                           name={contact.name} 
                           photoURL={contact.photoURL}
-                          status={contact.isOnline ? 'online' : 'offline'}
+                          status={contact.status?.toLowerCase() as any || 'offline'}
                           size="md"
                         />
                         <div className="flex-1 min-w-0">
@@ -2500,7 +2473,7 @@ function DashboardPage() {
                             <h4 className="text-sm font-medium text-silver truncate">{contact.name}</h4>
                             <span className="text-[9px] uppercase tracking-wider px-2 py-0.5 rounded bg-white/5 text-silver/60">Priority {contact.priority}</span>
                           </div>
-                          <p className="text-[11px] text-silver/40">{contact.relationship} • {contact.phone}</p>
+                          <p className="text-[11px] text-silver/40">{contact.type} • {contact.phone}</p>
                         </div>
                         <button 
                           onClick={() => handleDeleteContact(contact.id)}
@@ -3361,7 +3334,7 @@ function DashboardPage() {
                     <span className="text-[9px] uppercase tracking-widest text-silver/40 font-bold">Safety Sessions</span>
                   </div>
                   <div className="glass-panel p-5 rounded-3xl border-white/5 bg-white/[0.02] flex flex-col items-center justify-center">
-                    <span className="text-2xl font-light text-white mb-1">{contacts.length}</span>
+                    <span className="text-2xl font-light text-white mb-1">{guardians.length}</span>
                     <span className="text-[9px] uppercase tracking-widest text-silver/40 font-bold">Trusted Network</span>
                   </div>
                 </div>

@@ -44,7 +44,6 @@ export function useGuardians(user: User | null, currentTelemetry: any) {
 
     const q = query(
       collection(db, "users", user.uid, "guardians"), 
-      where("userId", "==", user.uid),
       orderBy("priority", "asc")
     );
 
