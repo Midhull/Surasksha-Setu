@@ -1,5 +1,5 @@
 import { Map, AdvancedMarker, useMap } from "@vis.gl/react-google-maps";
-import { useEffect, useState, useMemo, useRef } from "react";
+import React, { useEffect, useState, useMemo, useRef } from "react";
 import { locationService, LocationTelemetry } from "../services/locationService";
 import { LocationState } from "../types/emergency";
 import { logger } from "../services/incidentLogger";
@@ -200,7 +200,7 @@ function MapController({ telemetry, destination, sosActive }: { telemetry: Locat
   return null;
 }
 
-export function GMap({
+export const GMap = React.memo(function GMap({
   className,
   sosActive = false,
   destination,
@@ -250,7 +250,7 @@ export function GMap({
       if (intervalId) clearTimeout(intervalId);
       logOperational('MAP_INIT', 'Telemetry subsystem disposed');
     };
-  }, [sosActive]);
+  }, [sosActive, onTelemetryUpdate]);
 
   const center = useMemo(() => {
     if (telemetry && telemetry.latitude && telemetry.longitude) {
@@ -332,4 +332,4 @@ export function GMap({
       </Map>
     </div>
   );
-}
+});

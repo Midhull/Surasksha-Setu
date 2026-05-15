@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useMemo } from 'react';
 import { collection, query, where, orderBy, onSnapshot } from 'firebase/firestore';
 import { db } from '../lib/firebase';
 import { User } from 'firebase/auth';
@@ -33,9 +33,11 @@ export function useGuardians(user: User | null, currentTelemetry: any) {
     return R * c;
   };
 
+  const [rawGuardians, setRawGuardians] = useState<any[]>([]);
+
   useEffect(() => {
     if (!user) {
-      setGuardians([]);
+      setRawGuardians([]);
       setLoading(false);
       return;
     }
@@ -47,34 +49,7 @@ export function useGuardians(user: User | null, currentTelemetry: any) {
     );
 
     const unsub = onSnapshot(q, (snapshot) => {
-      const data = snapshot.docs.map(doc => {
-        const d = doc.data();
-        const lastSeenMs = d.lastSeen?.toMillis() || 0;
-        const now = Date.now();
-        
-        let status: Guardian['status'] = 'OFFLINE';
-        if (now - lastSeenMs < 120000) {
-          status = 'ONLINE'; 
-        } else if (lastSeenMs > 0) {
-          status = 'UNKNOWN';
-        }
-
-        let distanceStr = '';
-        if (d.lat && d.lng && currentTelemetry?.latitude) {
-          const dist = calculateDistance(currentTelemetry.latitude, currentTelemetry.longitude, d.lat, d.lng);
-          if (dist < 0.5 && status === 'ONLINE') status = 'NEARBY';
-          else if (status === 'ONLINE') status = 'AWAY';
-          distanceStr = dist < 1 ? `${(dist * 1000).toFixed(0)} M` : `${dist.toFixed(1)} KM`;
-        }
-
-        return {
-          id: doc.id,
-          ...d,
-          status,
-          distance: distanceStr
-        } as Guardian;
-      });
-      setGuardians(data);
+      setRawGuardians(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })));
       setLoading(false);
     }, (error) => {
       console.error("[GUARD] Listener failed:", error);
@@ -82,7 +57,37 @@ export function useGuardians(user: User | null, currentTelemetry: any) {
     });
 
     return () => unsub();
-  }, [user?.uid, currentTelemetry?.latitude, currentTelemetry?.longitude]);
+  }, [user?.uid]);
+
+  const processedGuardians = useMemo(() => {
+    return rawGuardians.map(d => {
+      const lastSeenMs = d.lastSeen?.toMillis() || 0;
+      const now = Date.now();
+      
+      let status: Guardian['status'] = 'OFFLINE';
+      if (now - lastSeenMs < 120000) {
+        status = 'ONLINE'; 
+      } else if (lastSeenMs > 0) {
+        status = 'UNKNOWN';
+      }
+
+      let distanceStr = '';
+      if (d.lat && d.lng && currentTelemetry?.latitude) {
+        const dist = calculateDistance(currentTelemetry.latitude, currentTelemetry.longitude, d.lat, d.lng);
+        if (dist < 0.5 && status === 'ONLINE') status = 'NEARBY';
+        else if (status === 'ONLINE') status = 'AWAY';
+        distanceStr = dist < 1 ? `${(dist * 1000).toFixed(0)} M` : `${dist.toFixed(1)} KM`;
+      }
+
+      return {
+        ...d,
+        status,
+        distance: distanceStr
+      } as Guardian;
+    });
+  }, [rawGuardians, currentTelemetry?.latitude, currentTelemetry?.longitude]);
+
+  return { guardians: processedGuardians, loading };
 
   return { guardians, loading };
 }

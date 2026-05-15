@@ -41,7 +41,7 @@ export const AuthLayout: React.FC<AuthLayoutProps> = ({
         </div>
 
         {/* Main Auth Surface */}
-        <div className="glass-panel p-8 md:p-10 rounded-[2.5rem] bg-white/[0.03] border-white/10 backdrop-blur-2xl shadow-[0_32px_64px_-16px_rgba(0,0,0,0.5)]">
+        <div className="glass-panel p-8 md:p-10 rounded-[2.5rem] bg-white/[0.03] border-white/10 backdrop-blur-xl shadow-[0_32px_64px_-16px_rgba(0,0,0,0.5)]">
           {children}
         </div>
 

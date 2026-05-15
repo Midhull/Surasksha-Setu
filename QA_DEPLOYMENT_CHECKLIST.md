@@ -34,6 +34,12 @@ This document defines the mandatory validation steps required for certifying Sur
 - [ ] **Environment Variables**: Confirm all production keys (Maps, Firebase) are correctly configured in the deployment environment.
 - [ ] **Build Optimization**: Run `npm run build` and verify that the bundle size is optimized for low-bandwidth emergency scenarios.
 
+## 5. Telegram Emergency Automation (Infrastructure)
+- [ ] **Blaze Plan Upgrade**: Upgrade Firebase project to Blaze plan to allow outbound API calls to Telegram.
+- [ ] **Secret Injection**: Execute `firebase functions:config:set telegram.token="..." telegram.chat_id="..."` for production credentials.
+- [ ] **Function Deployment**: Run `firebase deploy --only functions` and verify the `notifyEmergencyOnTelegram` function is active.
+- [ ] **End-to-End Alerting**: Trigger a manual SOS and verify that the Telegram alert arrives with the correct Trigger Type and Google Maps link.
+
 ---
 **Status**: [STABILIZATION PHASE]
 **Lead**: Antigravity AI

@@ -3,16 +3,17 @@ import { motion } from "framer-motion";
 interface AIOrbProps {
   size?: number;
   intensity?: number;
+  isGrounded?: boolean;
 }
 
-export function AIOrb({ size = 240, intensity = 1 }: AIOrbProps) {
+export function AIOrb({ size = 240, intensity = 1, isGrounded = false }: AIOrbProps) {
   return (
     <div
       className="relative flex items-center justify-center"
       style={{ width: size, height: size }}
     >
       {/* Outer pulse rings */}
-      {[0, 1, 2].map((i) => (
+      {!isGrounded && [0, 1, 2].map((i) => (
         <span
           key={i}
           className="absolute inset-0 rounded-full border animate-pulse-ring"
@@ -33,13 +34,13 @@ export function AIOrb({ size = 240, intensity = 1 }: AIOrbProps) {
             "radial-gradient(circle, oklch(0.68 0.28 25 / 0.35) 0%, transparent 60%)",
           filter: `blur(${20 * intensity}px)`,
         }}
-        animate={{ scale: [1, 1.15, 1], opacity: [0.6, 0.95, 0.6] }}
-        transition={{ duration: 4, repeat: Infinity, ease: "easeInOut" }}
+        animate={isGrounded ? { scale: 1, opacity: 0.5 } : { scale: [1, 1.15, 1], opacity: [0.6, 0.95, 0.6] }}
+        transition={isGrounded ? { duration: 0 } : { duration: 4, repeat: Infinity, ease: "easeInOut" }}
       />
 
       {/* Orb body */}
       <motion.div
-        className="relative rounded-full overflow-hidden animate-breathe"
+        className={`relative rounded-full overflow-hidden ${isGrounded ? '' : 'animate-breathe'}`}
         style={{
           width: size,
           height: size,
@@ -56,8 +57,8 @@ export function AIOrb({ size = 240, intensity = 1 }: AIOrbProps) {
               "conic-gradient(from 0deg, transparent, oklch(0.85 0.15 25 / 0.6), transparent 40%, oklch(0.95 0.02 250 / 0.4), transparent 80%)",
             mixBlendMode: "screen",
           }}
-          animate={{ rotate: 360 }}
-          transition={{ duration: 12, repeat: Infinity, ease: "linear" }}
+          animate={isGrounded ? { rotate: 0 } : { rotate: 360 }}
+          transition={isGrounded ? { duration: 0 } : { duration: 12, repeat: Infinity, ease: "linear" }}
         />
 
         {/* Reflective highlight */}
@@ -81,8 +82,8 @@ export function AIOrb({ size = 240, intensity = 1 }: AIOrbProps) {
             background:
               "radial-gradient(circle, oklch(1 0 0) 0%, oklch(0.78 0.28 25) 40%, transparent 70%)",
           }}
-          animate={{ opacity: [0.7, 1, 0.7], scale: [0.9, 1.1, 0.9] }}
-          transition={{ duration: 2.5, repeat: Infinity, ease: "easeInOut" }}
+          animate={isGrounded ? { opacity: 0.8, scale: 1 } : { opacity: [0.7, 1, 0.7], scale: [0.9, 1.1, 0.9] }}
+          transition={isGrounded ? { duration: 0 } : { duration: 2.5, repeat: Infinity, ease: "easeInOut" }}
         />
 
         {/* Light sweep */}

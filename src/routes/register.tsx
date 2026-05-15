@@ -1,5 +1,5 @@
 import { createFileRoute, useNavigate, Link } from "@tanstack/react-router";
-import { useState, useEffect } from "react";
+import React, { useState, useEffect, useCallback } from "react";
 import { Mail, Lock, User, AlertCircle } from "lucide-react";
 import { useAuth } from "@/hooks/useAuth";
 import { authService } from "@/services/authService";
@@ -27,22 +27,32 @@ function RegisterPage() {
     }
   }, [user, authLoading, navigate]);
 
-  const handleRegister = async (e: React.FormEvent) => {
+  const handleNameChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
+    setName(e.target.value);
+  }, []);
+
+  const handleEmailChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
+    setEmail(e.target.value);
+  }, []);
+
+  const handlePasswordChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
+    setPassword(e.target.value);
+  }, []);
+
+  const handleRegister = useCallback(async (e: React.FormEvent) => {
     e.preventDefault();
     setLoading(true);
     setError(null);
     try {
       await authService.registerUser(email, password);
-      // Profile name sync is handled in authService.syncUserDoc 
-      // but we might want to update displayName if it's missing
     } catch (err: any) {
       setError(authService.handleAuthError(err));
     } finally {
       setLoading(false);
     }
-  };
+  }, [email, password]);
 
-  const handleGoogleLogin = async () => {
+  const handleGoogleLogin = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
@@ -52,7 +62,7 @@ function RegisterPage() {
     } finally {
       setLoading(false);
     }
-  };
+  }, []);
 
   return (
     <AuthLayout
@@ -82,7 +92,7 @@ function RegisterPage() {
           type="text"
           placeholder="John Doe"
           value={name}
-          onChange={(e) => setName(e.target.value)}
+          onChange={handleNameChange}
           icon={<User className="w-4 h-4" />}
           required
         />
@@ -92,7 +102,7 @@ function RegisterPage() {
           type="email"
           placeholder="name@example.com"
           value={email}
-          onChange={(e) => setEmail(e.target.value)}
+          onChange={handleEmailChange}
           icon={<Mail className="w-4 h-4" />}
           required
         />
@@ -102,7 +112,7 @@ function RegisterPage() {
           type="password"
           placeholder="••••••••"
           value={password}
-          onChange={(e) => setPassword(e.target.value)}
+          onChange={handlePasswordChange}
           icon={<Lock className="w-4 h-4" />}
           required
         />

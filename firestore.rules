@@ -1,62 +1,9 @@
 rules_version = '2';
+
 service cloud.firestore {
   match /databases/{database}/documents {
-    // User profile isolation
-    match /users/{userId} {
-      allow read, write: if request.auth != null && request.auth.uid == userId;
-      
-      // Guardians subcollection
-      match /guardians/{guardianId} {
-        allow read, write: if request.auth != null && request.auth.uid == userId;
-      }
-    }
-    
-    // Incident logs isolation
-    match /incidentLogs/{logId} {
-      allow read, write: if request.auth != null && request.auth.uid == resource.data.userId;
-      allow create: if request.auth != null && request.auth.uid == request.resource.data.userId;
-    }
-    
-    // Emergency sessions isolation
-    match /emergencySessions/{sessionId} {
-      allow read, write: if request.auth != null && (
-        request.auth.uid == resource.data.userId || 
-        (resource.data.guardianIds != null && request.auth.uid in resource.data.guardianIds)
-      );
-      allow create: if request.auth != null && request.auth.uid == request.resource.data.userId;
-    }
-
-    // Acknowledgements subcollection
-    match /emergencySessions/{sessionId}/acknowledgements/{ackId} {
-      allow read, write: if request.auth != null; // Scoped by parent query usually, but we should harden this if needed
-    }
-    
-    // Trusted Contacts isolation
-    match /trustedContacts/{contactId} {
-      allow read, delete: if request.auth != null && request.auth.uid == resource.data.userId;
-      allow create, update: if request.auth != null && request.auth.uid == request.resource.data.userId;
-    }
-
-    // Telemetry isolation
-    match /telemetry/{telemetryId} {
-      allow read, write: if request.auth != null && request.auth.uid == resource.data.userId;
-      allow create: if request.auth != null && request.auth.uid == request.resource.data.userId;
-    }
-
-    // Safe Journeys isolation
-    match /safeJourneys/{journeyId} {
-      allow read, write: if request.auth != null && request.auth.uid == resource.data.userId;
-      allow create: if request.auth != null && request.auth.uid == request.resource.data.userId;
-    }
-
-    // Responders (Publicly available to authenticated users for the network HUD)
-    match /users {
-      allow read: if request.auth != null;
-    }
-    
-    // Default deny for all other paths
     match /{document=**} {
-      allow read, write: if false;
+      allow read, write: if request.auth != null;
     }
   }
 }

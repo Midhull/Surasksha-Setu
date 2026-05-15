@@ -1,7 +1,7 @@
 import React from 'react';
 import { useForm } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
-import * as z from 'zod';
+import { z } from 'zod';
 import { motion } from 'framer-motion';
 import { User, Phone, Briefcase, FileText, Save } from 'lucide-react';
 import { UserProfile } from '../../types/user';
@@ -127,7 +127,8 @@ export const IdentityCard: React.FC<IdentityCardProps> = ({ profile, onUpdate })
         </div>
 
         <div className="pt-4 flex justify-end">
-          <button
+          <motion.button
+            whileTap={{ scale: 0.95 }}
             type="submit"
             disabled={!isDirty || isSubmitting}
             className={`
@@ -150,7 +151,7 @@ export const IdentityCard: React.FC<IdentityCardProps> = ({ profile, onUpdate })
                 <div className="absolute inset-0 bg-white/10 animate-light-sweep" />
               </div>
             )}
-          </button>
+          </motion.button>
         </div>
       </form>
     </motion.div>

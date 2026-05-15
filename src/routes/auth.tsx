@@ -1,9 +1,5 @@
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
-import { useEffect } from "react";
-
-export const Route = createFileRoute("/auth")({
-  component: AuthRedirect,
-});
+import React, { useEffect } from "react";
 
 function AuthRedirect() {
   const navigate = useNavigate();
@@ -13,3 +9,7 @@ function AuthRedirect() {
 
   return null;
 }
+
+export const Route = createFileRoute("/auth")({
+  component: AuthRedirect,
+});

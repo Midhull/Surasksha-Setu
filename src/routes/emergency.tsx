@@ -1,7 +1,7 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { motion, AnimatePresence } from "framer-motion";
 import { PhoneOff, MapPin, Mic, Users, Zap, ShieldAlert, Wifi, Activity, AlertCircle, Radio, Siren, Eye, Share2 } from "lucide-react";
-import { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import { AIOrb } from "../components/AIOrb";
 import { IdentityAvatar } from "../components/IdentityAvatar";
 import { useAuth } from "../hooks/useAuth";

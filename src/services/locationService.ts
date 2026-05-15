@@ -137,8 +137,13 @@ class LocationService {
               fallbackUsed: false
             };
 
-            this.saveFallbackLocation(telemetry);
-            resolve(telemetry);
+            if (this.validateCoordinates(latitude, longitude)) {
+              this.saveFallbackLocation(telemetry);
+              resolve(telemetry);
+            } else {
+              logger.log('medium', 'GPS', 'Invalid coordinates detected (Null Island). Using fallback.');
+              resolve(this.handleFallback());
+            }
           },
           (err) => {
             console.warn(`GPS fetch failed. Attempt ${retryCount + 1}`, err);
@@ -156,6 +161,15 @@ class LocationService {
 
       attemptFetch();
     });
+  }
+
+  private validateCoordinates(lat: number | null, lng: number | null): boolean {
+    if (lat === null || lng === null) return false;
+    // Basic range validation
+    if (lat < -90 || lat > 90 || lng < -180 || lng > 180) return false;
+    // Null Island check (0,0) - often returned by faulty GPS or emulators
+    if (Math.abs(lat) < 0.0001 && Math.abs(lng) < 0.0001) return false;
+    return true;
   }
 
   private handleFallback(): LocationTelemetry {

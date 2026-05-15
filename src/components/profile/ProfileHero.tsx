@@ -68,7 +68,8 @@ export const ProfileHero: React.FC<ProfileHeroProps> = ({ profile, onUpdate }) =
             )}
 
             {/* Upload Overlay */}
-            <button 
+            <motion.button 
+              whileTap={{ scale: 0.95 }}
               onClick={() => fileInputRef.current?.click()}
               disabled={isUploading}
               className="absolute inset-0 bg-black/60 opacity-0 group-hover:opacity-100 transition-all duration-500 flex flex-col items-center justify-center gap-2 cursor-pointer backdrop-blur-sm"
@@ -81,7 +82,7 @@ export const ProfileHero: React.FC<ProfileHeroProps> = ({ profile, onUpdate }) =
                   <span className="text-[10px] uppercase tracking-[0.2em] font-medium text-silver/80">Update Visual</span>
                 </>
               )}
-            </button>
+            </motion.button>
           </div>
         </motion.div>
 

@@ -1,15 +1,11 @@
 import { createFileRoute, useNavigate, Link } from "@tanstack/react-router";
-import { useState, useEffect } from "react";
+import React, { useState, useEffect, useCallback } from "react";
 import { Mail, Lock, AlertCircle } from "lucide-react";
 import { useAuth } from "@/hooks/useAuth";
 import { authService } from "@/services/authService";
 import { AuthLayout } from "@/components/AuthLayout";
 import { AuthInput, AuthButton } from "@/components/AuthComponents";
 import { motion, AnimatePresence } from "framer-motion";
-
-export const Route = createFileRoute("/login")({
-  component: LoginPage,
-});
 
 function LoginPage() {
   const [email, setEmail] = useState("");
@@ -26,7 +22,15 @@ function LoginPage() {
     }
   }, [user, authLoading, navigate]);
 
-  const handleLogin = async (e: React.FormEvent) => {
+  const handleEmailChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
+    setEmail(e.target.value);
+  }, []);
+
+  const handlePasswordChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
+    setPassword(e.target.value);
+  }, []);
+
+  const handleLogin = useCallback(async (e: React.FormEvent) => {
     e.preventDefault();
     setLoading(true);
     setError(null);
@@ -37,9 +41,9 @@ function LoginPage() {
     } finally {
       setLoading(false);
     }
-  };
+  }, [email, password]);
 
-  const handleGoogleLogin = async () => {
+  const handleGoogleLogin = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
@@ -49,7 +53,7 @@ function LoginPage() {
     } finally {
       setLoading(false);
     }
-  };
+  }, []);
 
   return (
     <AuthLayout
@@ -79,7 +83,7 @@ function LoginPage() {
           type="email"
           placeholder="name@example.com"
           value={email}
-          onChange={(e) => setEmail(e.target.value)}
+          onChange={handleEmailChange}
           icon={<Mail className="w-4 h-4" />}
           required
         />
@@ -90,7 +94,7 @@ function LoginPage() {
             type="password"
             placeholder="••••••••"
             value={password}
-            onChange={(e) => setPassword(e.target.value)}
+            onChange={handlePasswordChange}
             icon={<Lock className="w-4 h-4" />}
             required
           />
@@ -134,3 +138,7 @@ function LoginPage() {
     </AuthLayout>
   );
 }
+
+export const Route = createFileRoute("/login")({
+  component: LoginPage,
+});

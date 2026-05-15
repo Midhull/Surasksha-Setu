@@ -1,4 +1,16 @@
-import { collection, addDoc, serverTimestamp, doc, getDoc, setDoc, updateDoc } from 'firebase/firestore';
+import { 
+  collection, 
+  addDoc, 
+  serverTimestamp, 
+  doc, 
+  getDoc, 
+  setDoc, 
+  updateDoc, 
+  query, 
+  where, 
+  getDocs, 
+  limit 
+} from 'firebase/firestore';
 import { db } from '../lib/firebase';
 import { logger } from './incidentLogger';
 import { EmergencyPayload, TriggerType, MedicalProfileData, LifecycleStage } from '../types/emergency';
@@ -132,6 +144,44 @@ class EmergencyService {
     } catch (e) {
       console.error("[DEBUG] Error marking false alarm:", e);
       return false;
+    }
+  }
+
+  async acknowledgeEmergency(sessionId: string, guardianId: string, guardianName: string, note?: string): Promise<boolean> {
+    try {
+      const ackRef = collection(db, "emergencySessions", sessionId, "acknowledgements");
+      await addDoc(ackRef, {
+        guardianId,
+        guardianName,
+        note: note || "I am responding",
+        timestamp: serverTimestamp(),
+        type: 'GUARDIAN_RESPONSE'
+      });
+      logger.log('high', 'Emergency Orchestration', `Verified response logged: ${guardianName}`);
+      return true;
+    } catch (e) {
+      console.error("Error acknowledging emergency:", e);
+      return false;
+    }
+  }
+
+  async getActiveSession(userId: string): Promise<{id: string, data: any} | null> {
+    try {
+      const q = query(
+        collection(db, "emergencySessions"),
+        where("userId", "==", userId),
+        where("status", "==", "ACTIVE"),
+        limit(1)
+      );
+      const querySnapshot = await getDocs(q);
+      if (!querySnapshot.empty) {
+        const doc = querySnapshot.docs[0];
+        return { id: doc.id, data: doc.data() };
+      }
+      return null;
+    } catch (e) {
+      console.error("Error fetching active session:", e);
+      return null;
     }
   }
 }

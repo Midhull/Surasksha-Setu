@@ -3,6 +3,7 @@ import { useState, useRef, MouseEvent } from "react";
 import { AIOrb } from "./AIOrb";
 import { Particles } from "./Particles";
 import { RadarSweep } from "./RadarSweep";
+import { useAdaptiveMotion } from "../../hooks/useAdaptiveMotion";
 
 interface HeroFinalProps {
   onEnter: () => void;
@@ -12,8 +13,10 @@ export function HeroFinal({ onEnter }: HeroFinalProps) {
   const [ripples, setRipples] = useState<{ id: number; x: number; y: number }[]>([]);
   const btnRef = useRef<HTMLButtonElement>(null);
   const [tilt, setTilt] = useState({ x: 0, y: 0 });
+  const motionProfile = useAdaptiveMotion(false, false); // Hero page isn't SOS, but respects system settings
 
   const handleMove = (e: MouseEvent<HTMLButtonElement>) => {
+    if (motionProfile.isGrounded) return;
     const rect = btnRef.current?.getBoundingClientRect();
     if (!rect) return;
     const x = (e.clientX - rect.left - rect.width / 2) / rect.width;
@@ -52,7 +55,7 @@ export function HeroFinal({ onEnter }: HeroFinalProps) {
         <RadarSweep size={900} />
       </div>
 
-      <Particles count={70} color="oklch(0.78 0.2 25 / 0.5)" />
+      <Particles count={motionProfile.isGrounded ? 20 : 70} color="oklch(0.78 0.2 25 / 0.5)" />
 
       {/* Centerpiece */}
       <div className="relative z-10 flex flex-col items-center justify-center px-6 text-center">
@@ -61,7 +64,7 @@ export function HeroFinal({ onEnter }: HeroFinalProps) {
           animate={{ scale: 1, opacity: 1 }}
           transition={{ duration: 2, ease: [0.16, 1, 0.3, 1] }}
         >
-          <AIOrb size={200} />
+          <AIOrb size={200} isGrounded={motionProfile.isGrounded} />
         </motion.div>
 
         <motion.div
@@ -100,19 +103,21 @@ export function HeroFinal({ onEnter }: HeroFinalProps) {
           animate={{
             opacity: 1,
             y: 0,
-            boxShadow: [
-              "0 0 40px oklch(0.58 0.24 22 / 0.3), inset 0 0 20px oklch(0.78 0.28 25 / 0.15)",
-              "0 0 70px oklch(0.58 0.24 22 / 0.6), inset 0 0 30px oklch(0.78 0.28 25 / 0.25)",
-              "0 0 40px oklch(0.58 0.24 22 / 0.3), inset 0 0 20px oklch(0.78 0.28 25 / 0.15)",
-            ],
+            boxShadow: motionProfile.isGrounded 
+              ? "0 0 30px oklch(0.58 0.24 22 / 0.3), inset 0 0 10px oklch(0.78 0.28 25 / 0.1)"
+              : [
+                "0 0 40px oklch(0.58 0.24 22 / 0.3), inset 0 0 20px oklch(0.78 0.28 25 / 0.15)",
+                "0 0 70px oklch(0.58 0.24 22 / 0.6), inset 0 0 30px oklch(0.78 0.28 25 / 0.25)",
+                "0 0 40px oklch(0.58 0.24 22 / 0.3), inset 0 0 20px oklch(0.78 0.28 25 / 0.15)",
+              ],
           }}
           transition={{
-            opacity: { duration: 1.4, delay: 1.4 },
-            y: { duration: 1.4, delay: 1.4 },
+            opacity: { duration: 0.8, delay: motionProfile.isGrounded ? 0.2 : 1.4 },
+            y: { duration: 0.8, delay: motionProfile.isGrounded ? 0.2 : 1.4 },
             boxShadow: { duration: 3, repeat: Infinity, ease: "easeInOut" },
           }}
-          whileHover={{ scale: 1.04 }}
-          whileTap={{ scale: 0.97 }}
+          whileHover={{ scale: motionProfile.isGrounded ? 1 : 1.04 }}
+          whileTap={{ scale: motionProfile.tapScale }}
         >
           {/* Light sweep */}
           <span

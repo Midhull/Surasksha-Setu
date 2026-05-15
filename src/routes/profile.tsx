@@ -9,7 +9,9 @@ import { IdentityCard } from '../components/profile/IdentityCard';
 import { SecurityPanel } from '../components/profile/SecurityPanel';
 import { DangerZone } from '../components/profile/DangerZone';
 import { LogoutButton } from '../components/profile/LogoutButton';
-import { Loader2, ShieldAlert } from 'lucide-react';
+import { Loader2, ShieldAlert, Shield } from 'lucide-react';
+import { useAdaptiveMotion } from '../hooks/useAdaptiveMotion';
+import { Skeleton } from '../components/Skeleton';
 
 export const Route = createFileRoute('/profile')({
   component: ProfilePage,
@@ -21,6 +23,7 @@ function ProfilePage() {
   const [profile, setProfile] = useState<UserProfile | null>(null);
   const [profileLoading, setProfileLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const motionProfile = useAdaptiveMotion(false, false);
 
   useEffect(() => {
     if (!authLoading && !user) {
@@ -65,14 +68,18 @@ function ProfilePage() {
 
   if (authLoading || profileLoading) {
     return (
-      <div className="min-h-screen bg-[#050507] flex flex-col items-center justify-center gap-6">
-        <div className="relative">
-          <div className="w-24 h-24 rounded-full border border-crimson/20 flex items-center justify-center">
-            <Loader2 className="w-8 h-8 text-crimson-glow animate-spin" />
-          </div>
-          <div className="absolute inset-0 w-24 h-24 rounded-full bg-crimson/5 animate-pulse blur-xl" />
+      <div className="min-h-screen bg-[#050507] flex flex-col items-center justify-center gap-8 relative overflow-hidden">
+        <div className="fixed inset-0 pointer-events-none z-0">
+          <div className="grid-overlay opacity-[0.03] absolute inset-0" />
         </div>
-        <p className="text-[10px] uppercase tracking-[0.4em] text-silver/40 font-bold">Synchronizing Identity</p>
+        <div className="relative z-10 flex flex-col items-center">
+          <div className="w-24 h-24 glass-panel rounded-full flex items-center justify-center mb-8 relative overflow-hidden">
+            <div className="absolute inset-0 shimmer-bg" style={{ opacity: motionProfile.shimmerOpacity }} />
+            <Shield className="w-8 h-8 text-crimson-glow/40" />
+          </div>
+          <Skeleton className="w-48 h-1.5 mb-4" opacity={motionProfile.shimmerOpacity} />
+          <p className="text-[10px] uppercase tracking-[0.4em] text-silver/40 font-bold">Synchronizing Identity Session</p>
+        </div>
       </div>
     );
   }
@@ -107,7 +114,7 @@ function ProfilePage() {
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
-            transition={{ duration: 1 }}
+            transition={{ duration: motionProfile.isGrounded ? 0.3 : 1 }}
           >
             {/* Top Navigation / Breadcrumb - Minimal */}
             <div className="pt-8 flex justify-between items-center">
@@ -117,12 +124,13 @@ function ProfilePage() {
                   Terminal // Profile Control
                 </span>
               </div>
-              <button 
+              <motion.button
+                whileTap={{ scale: motionProfile.tapScale }}
                 onClick={() => navigate({ to: '/dashboard' })}
                 className="text-[10px] uppercase tracking-widest font-bold text-silver/40 hover:text-silver transition-colors flex items-center gap-2 px-4 py-2 rounded-lg hover:bg-white/5 border border-transparent hover:border-white/10"
               >
                 Back to Command
-              </button>
+              </motion.button>
             </div>
 
             {/* Profile Content */}

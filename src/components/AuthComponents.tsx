@@ -1,4 +1,5 @@
-import React from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
+import { motion } from 'framer-motion';
 import { cn } from '@/lib/utils';
 
 interface AuthInputProps extends React.InputHTMLAttributes<HTMLInputElement> {
@@ -6,7 +7,7 @@ interface AuthInputProps extends React.InputHTMLAttributes<HTMLInputElement> {
   icon?: React.ReactNode;
 }
 
-export const AuthInput: React.FC<AuthInputProps> = ({ label, icon, className, ...props }) => {
+export const AuthInput = React.memo(({ label, icon, className, ...props }: AuthInputProps) => {
   return (
     <div className="space-y-2">
       <label className="text-[10px] uppercase tracking-[0.3em] text-silver/40 font-bold ml-1">
@@ -30,20 +31,22 @@ export const AuthInput: React.FC<AuthInputProps> = ({ label, icon, className, ..
       </div>
     </div>
   );
-};
+});
 
 interface AuthButtonProps extends React.ButtonHTMLAttributes<HTMLButtonElement> {
   variant?: 'primary' | 'secondary' | 'google';
   isLoading?: boolean;
+  tapScale?: number;
 }
 
-export const AuthButton: React.FC<AuthButtonProps> = ({ 
+export const AuthButton = React.memo(({ 
   children, 
   variant = 'primary', 
   isLoading, 
+  tapScale,
   className, 
   ...props 
-}) => {
+}: AuthButtonProps) => {
   const variants = {
     primary: "bg-crimson-glow text-white hover:bg-red-600 shadow-[0_8px_30px_rgba(220,38,38,0.2)]",
     secondary: "bg-white/[0.05] border border-white/10 text-silver hover:bg-white/[0.1]",
@@ -51,8 +54,9 @@ export const AuthButton: React.FC<AuthButtonProps> = ({
   };
 
   return (
-    <button
-      {...props}
+    <motion.button
+      whileTap={{ scale: tapScale || 0.98 }}
+      {...props as any}
       disabled={isLoading || props.disabled}
       className={cn(
         "w-full py-4 rounded-2xl text-[11px] font-bold uppercase tracking-[0.25em] transition-all duration-300 flex items-center justify-center gap-3 disabled:opacity-50 disabled:cursor-not-allowed",
@@ -65,6 +69,6 @@ export const AuthButton: React.FC<AuthButtonProps> = ({
       ) : (
         children
       )}
-    </button>
+    </motion.button>
   );
-};
+});

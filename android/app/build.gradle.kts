@@ -6,11 +6,11 @@ plugins {
 }
 
 android {
-    namespace = "com.suraksha.setu"
+    namespace = "com.surakshasetu.app"
     compileSdk = 35
-
+    
     defaultConfig {
-        applicationId = "com.suraksha.setu"
+        applicationId = "com.surakshasetu.app"
         minSdk = 26
         targetSdk = 35
         versionCode = 1

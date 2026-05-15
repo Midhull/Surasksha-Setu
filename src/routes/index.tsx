@@ -1,27 +1,11 @@
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { AnimatePresence, motion } from "framer-motion";
-import { useEffect, useState } from "react";
+import React, { useEffect, useState } from "react";
 import { Scene1Awakening } from "@/components/welcome/Scene1Awakening";
 import { Scene2World } from "@/components/welcome/Scene2World";
 import { Scene3SOS } from "@/components/welcome/Scene3SOS";
 import { Scene4Network } from "@/components/welcome/Scene4Network";
 import { HeroFinal } from "@/components/welcome/HeroFinal";
-
-export const Route = createFileRoute("/")({
-  component: Index,
-  head: () => ({
-    meta: [
-      { title: "Suraksha-Setu — AI-Powered Emergency Response System" },
-      {
-        name: "description",
-        content:
-          "Suraksha-Setu is an AI-powered emergency safety network — instant SOS, live tracking, and a connected protection system, anywhere, anytime.",
-      },
-      { property: "og:title", content: "Suraksha-Setu — AI Protection System" },
-      { property: "og:description", content: "Connected protection. Anywhere. Anytime." },
-    ],
-  }),
-});
 
 const SCENE_DURATIONS = [6500, 6000, 5500, 6000];
 
@@ -86,3 +70,19 @@ function Index() {
     </main>
   );
 }
+
+export const Route = createFileRoute("/")({
+  component: Index,
+  head: () => ({
+    meta: [
+      { title: "Suraksha-Setu — AI-Powered Emergency Response System" },
+      {
+        name: "description",
+        content:
+          "Suraksha-Setu is an AI-powered emergency safety network — instant SOS, live tracking, and a connected protection system, anywhere, anytime.",
+      },
+      { property: "og:title", content: "Suraksha-Setu — AI Protection System" },
+      { property: "og:description", content: "Connected protection. Anywhere. Anytime." },
+    ],
+  }),
+});

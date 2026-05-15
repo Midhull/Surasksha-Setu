@@ -5,20 +5,21 @@ import {
   Navigation, Activity, MessageSquare, CloudUpload, Route as RouteIcon, 
   Smartphone, EyeOff, Flashlight, UserCheck, BatteryMedium,
   Home, CheckCircle2, X, ExternalLink,
-  Battery, BatteryCharging, BatteryLow, BatteryFull
+  Battery, BatteryCharging, BatteryLow, BatteryFull, Brain
 } from "lucide-react";
-import { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect, useRef, Suspense, useMemo, useCallback } from "react";
 import { db, storage } from "../lib/firebase";
-import { collection, addDoc, serverTimestamp, query, orderBy, onSnapshot, deleteDoc, doc, updateDoc, where } from "firebase/firestore";
+import { collection, addDoc, serverTimestamp, query, orderBy, onSnapshot, deleteDoc, doc, updateDoc, where, getDocs } from "firebase/firestore";
 import { ref, uploadBytes, getDownloadURL } from "firebase/storage";
 import { GMap } from "../components/GMap";
 import { useMapsLibrary } from '@vis.gl/react-google-maps';
 import { LocationAutocomplete } from "../components/LocationAutocomplete";
 import { logger, IncidentEvent } from "../services/incidentLogger";
 import { locationService } from "../services/locationService";
-import { FakeCallModal } from '../components/FakeCallModal';
-import { FallDetectionModal } from '../components/FallDetectionModal';
-import { MedicalProfileModal } from '../components/MedicalProfileModal';
+const FakeCallModal = React.lazy(() => import('../components/FakeCallModal').then(m => ({ default: m.FakeCallModal })));
+const FallDetectionModal = React.lazy(() => import('../components/FallDetectionModal').then(m => ({ default: m.FallDetectionModal })));
+const MedicalProfileModal = React.lazy(() => import('../components/MedicalProfileModal').then(m => ({ default: m.MedicalProfileModal })));
+import { LocalizedErrorBoundary } from '../components/LocalizedErrorBoundary';
 import { emergencyService } from '../services/emergencyService';
 import { evidenceService } from '../services/evidenceService';
 import { AppErrorBoundary } from '../components/AppErrorBoundary';
@@ -35,34 +36,133 @@ import { useResponders } from "../hooks/useResponders";
 import { LocationState } from '../types/emergency';
 import { toast } from "sonner";
 import { IdentityAvatar } from "@/components/IdentityAvatar";
+import { useAdaptiveMotion } from "../hooks/useAdaptiveMotion";
+import { Skeleton } from "../components/Skeleton";
 
 const logOperational = (tag: string, message: string) => 
   console.log(`%c[${tag}]%c ${message}`, 'color: #dc2626; font-weight: bold', 'color: inherit');
 
-export const Route = createFileRoute("/dashboard")({
-  component: DashboardPage,
-});
+const calculateDistance = (lat1: number, lon1: number, lat2: number, lon2: number) => {
+  const R = 6371; // km
+  const dLat = (lat2 - lat1) * Math.PI / 180;
+  const dLon = (lon2 - lon1) * Math.PI / 180;
+  const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+            Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * 
+            Math.sin(dLon / 2) * Math.sin(dLon / 2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return R * c;
+};
+
+
 
 function DashboardPage() {
   const { user, loading: authLoading } = useAuth();
   const { profile } = useUserProfile(user);
   const [sosActive, setSosActive] = useState(false);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
+  const [isOnline, setIsOnline] = useState(typeof navigator !== 'undefined' ? navigator.onLine : true);
+  const [telegramStatus, setTelegramStatus] = useState<'PENDING' | 'SENT' | 'FAILED'>('PENDING');
   const navigate = useNavigate();
 
   useEffect(() => {
     if (!authLoading && !user) {
       navigate({ to: "/login" });
     }
+
+    const handleOnline = () => setIsOnline(true);
+    const handleOffline = () => setIsOnline(false);
+
+    window.addEventListener('online', handleOnline);
+    window.addEventListener('offline', handleOffline);
+    return () => {
+      window.removeEventListener('online', handleOnline);
+      window.removeEventListener('offline', handleOffline);
+    };
   }, [user, authLoading, navigate]);
 
   const { incidentEvents } = useIncidentLogs();
   const [mapMode, setMapMode] = useState<'IDLE' | 'TRACKING' | 'ROUTE' | 'NEARBY'>('IDLE');
-  const { currentTelemetry, setCurrentTelemetry, gpsStatus, gpsActive } = useTelemetry(user, sosActive, mapMode);
-  const { guardians } = useGuardians(user, currentTelemetry);
   const { batteryLevel, isCharging } = useBattery();
-  const { responderCount } = useResponders();
+  const { currentTelemetry, setCurrentTelemetry, gpsStatus, gpsActive, lastUpdated } = useTelemetry(user, sosActive, mapMode, batteryLevel);
+  const { guardians } = useGuardians(user, currentTelemetry);
+  const { responderCount } = useResponders(user);
   const mapState = useMap();
+  const [isRecovering, setIsRecovering] = useState(true);
+  const [isFetchingLocation, setIsFetchingLocation] = useState(false);
+  const [isEmergencyCountdownOpen, setIsEmergencyCountdownOpen] = useState(false);
+  const [isHiddenCountdownOpen, setIsHiddenCountdownOpen] = useState(false);
+  const [isManualCountdownOpen, setIsManualCountdownOpen] = useState(false);
+  const [isFallEscalating, setIsFallEscalating] = useState(false);
+  const [emergencyCountdown, setEmergencyCountdown] = useState<number | null>(null);
+  const emergencyTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const [fallCountdown, setFallCountdown] = useState<number | null>(null);
+  const fallTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const [hiddenCountdown, setHiddenCountdown] = useState<number | null>(null);
+  const hiddenTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const [manualCountdown, setManualCountdown] = useState<number | null>(null);
+  const manualTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const [journeyDestination, setJourneyDestination] = useState("");
+  const [journeyDuration, setJourneyDuration] = useState<number>(15);
+  const [activeJourney, setActiveJourney] = useState<any>(() => {
+    if (typeof window === 'undefined') return null;
+    const saved = localStorage.getItem('activeJourney');
+    return saved ? JSON.parse(saved) : null;
+  });
+  const [journeyTimeLeft, setJourneyTimeLeft] = useState<number | null>(null);
+  const [isJourneyDrawerOpen, setIsJourneyDrawerOpen] = useState(false);
+  const [isProfileDrawerOpen, setIsProfileDrawerOpen] = useState(false);
+  const [isEscalationOpen, setIsEscalationOpen] = useState(false);
+  const [escalationCountdown, setEscalationCountdown] = useState<number | null>(null);
+  const escalationTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const [isVoiceSettingsOpen, setIsVoiceSettingsOpen] = useState(false);
+  const [voiceEnabled, setVoiceEnabled] = useState(() => {
+    if (typeof window === 'undefined') return true;
+    const saved = localStorage.getItem('voiceEnabled');
+    return saved !== null ? JSON.parse(saved) : true;
+  });
+  const [autoRecord, setAutoRecord] = useState(() => {
+    if (typeof window === 'undefined') return true;
+    const saved = localStorage.getItem('autoRecord');
+    return saved !== null ? JSON.parse(saved) : true;
+  });
+  const [voiceQuality, setVoiceQuality] = useState<'Low' | 'Medium' | 'High'>(() => {
+    if (typeof window === 'undefined') return 'Medium';
+    return (localStorage.getItem('voiceQuality') as any) || 'Medium';
+  });
+  const [voiceMaxLength, setVoiceMaxLength] = useState<'30 Seconds' | '1 Minute' | '5 Minutes' | 'Unlimited'>(() => {
+    if (typeof window === 'undefined') return 'Unlimited';
+    return (localStorage.getItem('voiceMaxLength') as any) || 'Unlimited';
+  });
+  const [autoEvidenceUpload, setAutoEvidenceUpload] = useState(() => {
+    if (typeof window === 'undefined') return true;
+    const saved = localStorage.getItem('autoEvidenceUpload');
+    return saved !== null ? JSON.parse(saved) : true;
+  });
+  const [isFlashSettingsOpen, setIsFlashSettingsOpen] = useState(false);
+  const [flashEnabled, setFlashEnabled] = useState(() => {
+    if (typeof window === 'undefined') return true;
+    const saved = localStorage.getItem('flashEnabled');
+    return saved !== null ? JSON.parse(saved) : true;
+  });
+  const [flashMode, setFlashMode] = useState<'Screen Flash' | 'Torch Simulation'>(() => {
+    if (typeof window === 'undefined') return 'Screen Flash';
+    return (localStorage.getItem('flashMode') as any) || 'Screen Flash';
+  });
+  const [autoFlash, setAutoFlash] = useState(() => {
+    if (typeof window === 'undefined') return true;
+    const saved = localStorage.getItem('autoFlash');
+    return saved !== null ? JSON.parse(saved) : true;
+  });
+  const [flashSpeed, setFlashSpeed] = useState<'Slow' | 'Medium' | 'Fast'>(() => {
+    if (typeof window === 'undefined') return 'Medium';
+    return (localStorage.getItem('flashSpeed') as any) || 'Medium';
+  });
+  const [isFlashing, setIsFlashing] = useState(false);
+  const [lastActivation, setLastActivation] = useState<string>("Never");
+  const [hiddenLastActivation, setHiddenLastActivation] = useState<string>("Never");
+  const [flashLastActivation, setFlashLastActivation] = useState<string>("Never");
+  const [voiceLastRecording, setVoiceLastRecording] = useState<string>("Never");
+  const [logoTapCount, setLogoTapCount] = useState(0);
 
   const {
     routePolyline, setRoutePolyline,
@@ -86,16 +186,329 @@ function DashboardPage() {
   } = mapState;
 
 
-  const calculateDistance = (lat1: number, lon1: number, lat2: number, lon2: number) => {
-    const R = 6371; // km
-    const dLat = (lat2 - lat1) * Math.PI / 180;
-    const dLon = (lon2 - lon1) * Math.PI / 180;
-    const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-              Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * 
-              Math.sin(dLon / 2) * Math.sin(dLon / 2);
-    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-    return R * c;
-  };
+  const motionProfile = useAdaptiveMotion(sosActive, false);
+
+  const [isRecording, setIsRecording] = useState(false);
+  const [recordingSeconds, setRecordingSeconds] = useState(0);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const audioChunksRef = useRef<BlobPart[]>([]);
+  const currentEmergencyIdRef = useRef<string | null>(null);
+  const recordingTimerRef = useRef<NodeJS.Timeout | null>(null);
+
+  const stopRecording = useCallback(() => {
+    evidenceService.stopRecording();
+    setIsRecording(false);
+    if (recordingTimerRef.current) {
+      clearTimeout(recordingTimerRef.current);
+      recordingTimerRef.current = null;
+    }
+    setVoiceLastRecording(new Date().toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'}));
+    logger.log('info', 'Evidence Engine', 'Tactical audio recording finalized');
+  }, []);
+
+  const startRecording = useCallback(async (emergencyId: string | null = null) => {
+    if (isRecording || !voiceEnabled || !emergencyId) return;
+    
+    setIsRecording(true);
+    setRecordingSeconds(0);
+    evidenceService.startRecording(emergencyId);
+    
+    const tick = () => {
+      setRecordingSeconds(prev => {
+        const next = prev + 1;
+        
+        let maxSeconds = Infinity;
+        if (voiceMaxLength === '30 Seconds') maxSeconds = 30;
+        if (voiceMaxLength === '1 Minute') maxSeconds = 60;
+        if (voiceMaxLength === '5 Minutes') maxSeconds = 300;
+
+        if (next >= maxSeconds) {
+          stopRecording();
+          return prev; // Stop incrementing
+        }
+        
+        recordingTimerRef.current = setTimeout(tick, 1000);
+        return next;
+      });
+    };
+
+    recordingTimerRef.current = setTimeout(tick, 1000);
+    logger.log('medium', 'Evidence Engine', 'Tactical audio recording initiated');
+  }, [isRecording, voiceEnabled, voiceMaxLength, stopRecording]);
+
+  const finalizeSOS = useCallback(async (telemetry: any, triggerType: "SHAKE_SOS" | "HIDDEN_SOS" | "MANUAL_SOS" | "SAFE_JOURNEY_ESCALATION" | "FALL_DETECTION") => {
+    setIsFetchingLocation(false);
+    setIsEmergencyCountdownOpen(false);
+    setIsHiddenCountdownOpen(false);
+    setSosActive(true);
+    
+    const timeStr = new Date().toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
+    if (triggerType === "SHAKE_SOS") setLastActivation(timeStr);
+    if (triggerType === "HIDDEN_SOS") setHiddenLastActivation(timeStr);
+    
+    if (flashEnabled && autoFlash) {
+      logger.log('medium', 'Flashlight SOS', 'Auto SOS beacon armed');
+      setIsFlashing(true);
+      setFlashLastActivation(timeStr);
+    }
+
+    if (!navigator.onLine) {
+      logOperational('OFFLINE_MODE', 'Network uplink lost. Queuing SOS payload for retry...');
+      localStorage.setItem('emergency_queue', JSON.stringify({ telemetry, type: triggerType, timestamp: Date.now() }));
+      logger.log('high', 'System', 'Offline SOS queued');
+      return;
+    }
+
+    const sessionId = await emergencyService.createEmergencySession(triggerType, telemetry, user?.uid || '');
+    
+    if (sessionId) {
+      setActiveSessionId(sessionId);
+      if (voiceEnabled && autoRecord) {
+        logger.log('medium', 'Voice Recording', 'Auto-recording triggered');
+        startRecording(sessionId);
+      }
+      
+      // Initiation Log
+      logger.log('high', 'Emergency Orchestration', 'Awaiting verified guardian acknowledgements (Cloud Orchestration Active)');
+    }
+  }, [user?.uid, flashEnabled, autoFlash, voiceEnabled, autoRecord, startRecording]);
+
+  const analyzeRoute = useCallback(() => {
+    if (!routeStart || !routeDest) return;
+    setRouteAnalysisState('ANALYZING');
+    logger.log('low', 'Safe Route AI', `Geospatial intelligence scan initiated for destination: ${routeDest}`);
+
+    setTimeout(() => {
+      const destLower = routeDest.toLowerCase();
+      const startLower = routeStart.toLowerCase();
+      
+      let calculatedRisk: 'LOW' | 'MODERATE' | 'HIGH' = 'LOW';
+      let matchedZones: any[] = [];
+
+      // Simulated Geospatial Risk Analysis
+      if (structuredDest) {
+        const { lat, lng } = structuredDest;
+        // Mock: High risk if in a specific simulated "Dark Zone" (e.g. lat > 28.7)
+        if (lat > 28.72) {
+          matchedZones.push({ name: "Sector 4 Cluster", reason: "Elevated risk telemetry in target sector", risk: "HIGH" });
+          calculatedRisk = 'HIGH';
+        }
+      }
+
+      for (const zone of UNSAFE_ZONES) {
+        if (zone.keywords.some(k => destLower.includes(k) || startLower.includes(k))) {
+          matchedZones.push(zone);
+          if (zone.risk === 'HIGH') calculatedRisk = 'HIGH';
+          else if (zone.risk === 'MODERATE' && calculatedRisk !== 'HIGH') calculatedRisk = 'MODERATE';
+        }
+      }
+
+      const hour = new Date().getHours();
+      if ((hour >= 22 || hour < 5) && routeIsWalking) {
+        if (calculatedRisk === 'LOW') calculatedRisk = 'MODERATE';
+        matchedZones.push({ reason: "Late-night travel on foot" });
+      }
+
+      setRouteRisk(calculatedRisk);
+      
+      const insights = matchedZones.map(zone => zone.reason);
+      if (insights.length === 0) insights.push("Route appears safe under current conditions");
+      setRouteInsights(insights);
+
+      if (calculatedRisk === 'HIGH') {
+        setRouteRecommendation("CRITICAL: This route has elevated risk telemetry. We recommend taking a vehicle or choosing an alternative path.");
+        setRouteAlternative("Safe Detour via Main Street");
+      } else if (calculatedRisk === 'MODERATE') {
+        setRouteRecommendation("ADVISORY: Moderate risk factors detected. Maintain system readiness.");
+        setRouteAlternative("None required");
+      } else {
+        setRouteRecommendation("OPTIMAL: No significant threats detected along this path.");
+        setRouteAlternative("None required");
+      }
+
+      setRouteAnalysisState('RESULT');
+      logger.log('info', 'Safe Route AI', 'Intelligence scan finalized - insights ready');
+    }, 1500);
+  }, [routeStart, routeDest, structuredDest, routeIsWalking]);
+
+  const triggerShakeEmergency = useCallback(() => {
+    logOperational('TIMER', 'Shake countdown initiated (3s)');
+    setIsEmergencyCountdownOpen(true);
+    setEmergencyCountdown(3); // Standardized 3s for shake
+    if (window.navigator.vibrate) window.navigator.vibrate([200, 100, 200]);
+  }, []);
+
+  const cancelShakeEmergency = useCallback(() => {
+    setIsEmergencyCountdownOpen(false);
+    setEmergencyCountdown(null);
+    if (emergencyTimerRef.current) clearTimeout(emergencyTimerRef.current);
+  }, []);
+
+  const triggerFallEmergency = useCallback(() => {
+    logOperational('TIMER', 'Fall escalation initiated (15s)');
+    setIsFallEscalating(true);
+    setFallCountdown(15);
+    if (window.navigator.vibrate) window.navigator.vibrate([500, 500, 500]);
+    logger.log('medium', 'Fall Detection', 'Possible fall detected - waiting for response');
+  }, []);
+
+  const cancelFallEmergency = useCallback(() => {
+    setIsFallEscalating(false);
+    setFallCountdown(null);
+    if (fallTimerRef.current) clearTimeout(fallTimerRef.current);
+    logger.log('info', 'Fall Detection', 'Fall escalation cancelled by user');
+  }, []);
+
+  const triggerHiddenEmergency = useCallback(() => {
+    logOperational('TIMER', 'Hidden gesture confirmed. Discreet countdown (3s)');
+    setIsHiddenCountdownOpen(true);
+    setHiddenCountdown(3);
+    setLogoTapCount(0);
+    if (window.navigator.vibrate) window.navigator.vibrate([100]);
+  }, []);
+
+  const cancelHiddenEmergency = useCallback(() => {
+    setIsHiddenCountdownOpen(false);
+    setHiddenCountdown(null);
+    setLogoTapCount(0);
+    if (hiddenTimerRef.current) clearTimeout(hiddenTimerRef.current);
+  }, []);
+
+  const startSOS = useCallback(() => {
+    if (sosActive || isManualCountdownOpen) {
+      if (sosActive) {
+        logOperational('SOS', 'Active session detected. Termination initiated.');
+        setSosActive(false);
+        setIsFlashing(false);
+        stopRecording();
+      }
+      return;
+    }
+    logOperational('TIMER', 'SOS request initiated. Preparing systems...');
+    setManualCountdown(3);
+    setIsManualCountdownOpen(true);
+    if (window.navigator.vibrate) window.navigator.vibrate([100, 50, 100]);
+  }, [sosActive, isManualCountdownOpen, stopRecording]);
+
+  const cancelSOS = useCallback(() => {
+    setIsManualCountdownOpen(false);
+    setManualCountdown(null);
+    if (manualTimerRef.current) clearTimeout(manualTimerRef.current);
+    logOperational('TIMER', 'SOS request aborted by user');
+  }, []);
+
+  const confirmSafeArrival = useCallback(async () => {
+    setActiveJourney(null);
+    setJourneyTimeLeft(null);
+    setIsEscalationOpen(false);
+    setJourneyDestination("");
+    if (escalationTimerRef.current) clearTimeout(escalationTimerRef.current);
+    console.log("Arrival confirmed");
+  }, []);
+
+  const triggerJourneyEscalation = useCallback(() => {
+    if (isEscalationOpen) return;
+    console.log("Safe journey escalated - waiting for response");
+    setIsEscalationOpen(true);
+    setEscalationCountdown(30);
+  }, [isEscalationOpen]);
+
+  const startJourney = useCallback(async () => {
+    if (!journeyDestination) return;
+    const now = Date.now();
+    const expiresAtLocal = now + journeyDuration * 60 * 1000;
+    
+    const newJourney = {
+      userId: user.uid,
+      destination: journeyDestination,
+      coords: structuredDest ? { lat: structuredDest.lat, lng: structuredDest.lng } : null,
+      expectedArrivalTime: journeyDuration,
+      status: "ACTIVE",
+      expiresAtLocal,
+      startedAtLocal: now
+    };
+    setActiveJourney(newJourney);
+    setIsJourneyDrawerOpen(false);
+    console.log("Safe journey started");
+
+    try {
+      await addDoc(collection(db, "safeJourneys"), {
+        userId: user.uid,
+        destination: journeyDestination,
+        expectedArrivalTime: journeyDuration,
+        status: "ACTIVE",
+        startedAt: serverTimestamp()
+      });
+      logOperational('DB_WRITE', 'Safe Journey persistent node created');
+    } catch (e) {
+      console.error("Safe Journey persistence failed:", e);
+    }
+  }, [journeyDestination, journeyDuration, user?.uid, structuredDest]);
+
+  // --- HOISTED SOS & RECORDING INFRASTRUCTURE ---
+
+  useEffect(() => { if (typeof window !== 'undefined') localStorage.setItem('voiceEnabled', JSON.stringify(voiceEnabled)); }, [voiceEnabled]);
+  useEffect(() => { if (typeof window !== 'undefined') localStorage.setItem('autoRecord', JSON.stringify(autoRecord)); }, [autoRecord]);
+  useEffect(() => { if (typeof window !== 'undefined') localStorage.setItem('autoEvidenceUpload', JSON.stringify(autoEvidenceUpload)); }, [autoEvidenceUpload]);
+  useEffect(() => { if (typeof window !== 'undefined') localStorage.setItem('voiceQuality', voiceQuality); }, [voiceQuality]);
+  useEffect(() => { if (typeof window !== 'undefined') localStorage.setItem('voiceMaxLength', voiceMaxLength); }, [voiceMaxLength]);
+
+
+  const handleResolveEmergency = useCallback(async () => {
+    if (activeSessionId) {
+      await emergencyService.resolveEmergency(activeSessionId);
+      logger.log('info', 'Emergency Orchestration', 'Emergency resolved successfully');
+    }
+    setSosActive(false);
+    setActiveSessionId(null);
+    setIsFlashing(false);
+    if (isRecording) stopRecording();
+  }, [activeSessionId, isRecording, stopRecording]);
+
+  const handleFalseAlarm = useCallback(async () => {
+    if (activeSessionId) {
+      await emergencyService.markFalseAlarm(activeSessionId);
+      logger.log('info', 'Emergency Orchestration', 'False alarm marked by user');
+    }
+    setSosActive(false);
+    setActiveSessionId(null);
+    setIsFlashing(false);
+    if (isRecording) stopRecording();
+  }, [activeSessionId, isRecording, stopRecording]);
+
+  const activateEmergency = useCallback(async (type: "SHAKE_SOS" | "HIDDEN_SOS" | "MANUAL_SOS" | "SAFE_JOURNEY_ESCALATION" | "FALL_DETECTION") => {
+    if (sosActive || isFetchingLocation) return;
+    
+    // Clear countdowns
+    setEmergencyCountdown(null);
+    setHiddenCountdown(null);
+    setFallCountdown(null);
+    setManualCountdown(null);
+    setIsManualCountdownOpen(false);
+    setIsFallEscalating(false);
+    
+    logOperational('SOS', `Tactical Alert: ${type}. Synchronizing fresh telemetry...`);
+    setIsFetchingLocation(true);
+    
+    try {
+      // Force a high-accuracy fresh telemetry lock (retry count 2)
+      const telemetry = await locationService.getEmergencyTelemetry(2);
+      finalizeSOS(telemetry, type);
+    } catch (e) {
+      console.warn("Location Service failed entirely", e);
+      finalizeSOS({
+        latitude: 12.9716, 
+        longitude: 77.5946, 
+        accuracy: null, 
+        stale: true, 
+        fallbackUsed: true,
+        locationState: "UNAVAILABLE"
+      }, type);
+    }
+  }, [sosActive, isFetchingLocation, finalizeSOS]);
+
+
+
 
   // 1. GPS Status Acquisition (Handled by useTelemetry)
   
@@ -112,7 +525,7 @@ function DashboardPage() {
     const unsub = onSnapshot(
       query(
         collection(db, "emergencySessions", activeSessionId, "acknowledgements"),
-        where("userId", "==", user.uid)
+        where("type", "==", "GUARDIAN_RESPONSE")
       ), 
       (snapshot) => {
         logOperational('ORCHESTRATION', `[FIRESTORE] Syncing ${snapshot.size} acknowledgements`);
@@ -129,14 +542,62 @@ function DashboardPage() {
       },
       (error) => {
         console.error("[FIRESTORE] Acknowledgement listener failed:", error);
-        logOperational('ORCHESTRATION', '[FIRESTORE] [CRITICAL] Acknowledgement sync failed');
       }
     );
+
+    // Also listen to the session itself for Telegram status
+    const sessionUnsub = onSnapshot(doc(db, "emergencySessions", activeSessionId), (doc) => {
+      if (doc.exists()) {
+        const data = doc.data();
+        if (data.status === "INACTIVE" || data.status === "RESOLVED") {
+          // Add a short delay for emotional closure before returning to safe mode
+          setTimeout(() => {
+            setSosActive(false);
+            setActiveSessionId(null);
+          }, 3000);
+        }
+        // Expose telegram status if needed
+        setTelegramStatus(data.telegramStatus || "PENDING");
+      }
+    });
+
     return () => {
       unsub();
-      logOperational('ORCHESTRATION', '[FIRESTORE] Acknowledgement listener disposed');
+      sessionUnsub();
+      logOperational('ORCHESTRATION', '[FIRESTORE] Listeners disposed');
     };
   }, [sosActive, activeSessionId, user?.uid]);
+
+  // --- PASSIVE SESSION CLEANUP ---
+  useEffect(() => {
+    if (!user?.uid) return;
+    
+    const cleanup = async () => {
+      try {
+        const q = query(
+          collection(db, "emergencySessions"), 
+          where("userId", "==", user.uid), 
+          where("status", "==", "ACTIVE")
+        );
+        const snapshot = await getDocs(q);
+        const now = Date.now();
+        const FOUR_HOURS = 4 * 60 * 60 * 1000;
+
+        snapshot.docs.forEach(async (d) => {
+          const data = d.data();
+          const createdAt = data.createdAt?.toMillis() || data.timestamp?.toMillis() || 0;
+          if (createdAt && (now - createdAt) > FOUR_HOURS) {
+            console.log(`[CLEANUP] Resolving stale session: ${d.id}`);
+            await emergencyService.resolveEmergency(d.id);
+          }
+        });
+      } catch (e) {
+        console.error("[CLEANUP] Failed to process stale sessions:", e);
+      }
+    };
+
+    cleanup();
+  }, [user?.uid]);
 
   // 4. Offline SOS Queue Recovery Lifecycle
   useEffect(() => {
@@ -161,34 +622,48 @@ function DashboardPage() {
     return () => window.removeEventListener('online', purgeQueue);
   }, []);
 
-  const resolveEmergency = () => {
-    setSosActive(false);
-    setActiveSessionId(null);
-    localStorage.removeItem('sosActive');
-  };
+  // 3. Operational State Recovery (Critical for reliability)
+  useEffect(() => {
+    if (!user?.uid || authLoading) return;
+    
+    const recoverState = async () => {
+      setIsRecovering(true);
+      logOperational('RECOVERY', 'Scanning for active operational sessions...');
+      
+      try {
+        const localSos = localStorage.getItem('sosActive') === 'true';
+        const activeSession = await emergencyService.getActiveSession(user.uid);
+        
+        if (activeSession) {
+          logOperational('RECOVERY', `Found verified active session: ${activeSession.id}`);
+          setSosActive(true);
+          setActiveSessionId(activeSession.id);
+          setTelegramStatus(activeSession.data.telegramStatus || "PENDING");
+          logger.log('medium', 'System', 'Session re-hydrated from Firestore');
+        } else if (localSos) {
+          logOperational('RECOVERY', 'Local SOS state found but no server session. Syncing...');
+          setSosActive(false);
+          localStorage.removeItem('sosActive');
+        } else {
+          logOperational('RECOVERY', 'No active sessions found. System ready.');
+        }
+      } catch (e) {
+        console.error("[RECOVERY] Fatal recovery error:", e);
+      } finally {
+        setIsRecovering(false);
+      }
+      
+      evidenceService.checkStaleRecording();
+    };
 
-  const cancelEmergency = () => {
-    setSosActive(false);
-    setActiveSessionId(null);
-    localStorage.removeItem('sosActive');
-    logger.log('low', 'System', 'Emergency cancelled by user');
-  };
+    recoverState();
+  }, [user?.uid, authLoading]);
 
   useEffect(() => {
-    const sosState = typeof window !== 'undefined' ? localStorage.getItem('sosActive') : null;
-    if (!sosState) {
-      logger.log('low', 'System', 'System initialized');
-    } else {
-      logger.log('medium', 'System', 'System recovered from active emergency state');
-    }
-    evidenceService.checkStaleRecording();
-  }, []);
-
-  useEffect(() => {
-    if (typeof window !== 'undefined') {
+    if (typeof window !== 'undefined' && !isRecovering) {
       localStorage.setItem('sosActive', String(sosActive));
     }
-  }, [sosActive]);
+  }, [sosActive, isRecovering]);
 
   // --- SHAKE SOS STATE ---
   const [isShakeSettingsOpen, setIsShakeSettingsOpen] = useState(false);
@@ -203,15 +678,10 @@ function DashboardPage() {
   });
   const [bgMonitoring, setBgMonitoring] = useState(false);
   const [countdownDuration, setCountdownDuration] = useState<3 | 5 | 10>(5);
-  const [lastActivation, setLastActivation] = useState<string>("Never");
 
   useEffect(() => { if (typeof window !== 'undefined') localStorage.setItem('shakeEnabled', JSON.stringify(shakeEnabled)); }, [shakeEnabled]);
   useEffect(() => { if (typeof window !== 'undefined') localStorage.setItem('shakeSensitivity', shakeSensitivity); }, [shakeSensitivity]);
 
-  const [isEmergencyCountdownOpen, setIsEmergencyCountdownOpen] = useState(false);
-  const [emergencyCountdown, setEmergencyCountdown] = useState<number | null>(null);
-  const emergencyTimerRef = useRef<NodeJS.Timeout | null>(null);
-  const [isFetchingLocation, setIsFetchingLocation] = useState(false);
 
   // --- TRUSTED CIRCLE STATE ---
   const [isTrustedCircleOpen, setIsTrustedCircleOpen] = useState(false);
@@ -239,21 +709,13 @@ function DashboardPage() {
     if (typeof window === 'undefined') return 'Medium';
     return (localStorage.getItem('hiddenSensitivity') as any) || 'Medium';
   });
-  const [hiddenLastActivation, setHiddenLastActivation] = useState<string>("Never");
 
   useEffect(() => { if (typeof window !== 'undefined') localStorage.setItem('hiddenEnabled', JSON.stringify(hiddenEnabled)); }, [hiddenEnabled]);
   useEffect(() => { if (typeof window !== 'undefined') localStorage.setItem('hiddenSensitivity', hiddenSensitivity); }, [hiddenSensitivity]);
 
-  const [isHiddenCountdownOpen, setIsHiddenCountdownOpen] = useState(false);
-  const [hiddenCountdown, setHiddenCountdown] = useState<number | null>(null);
-  const hiddenTimerRef = useRef<NodeJS.Timeout | null>(null);
 
-  const [logoTapCount, setLogoTapCount] = useState(0);
   const logoTapTimerRef = useRef<NodeJS.Timeout | null>(null);
 
-  const [manualCountdown, setManualCountdown] = useState<number | null>(null);
-  const [isManualCountdownOpen, setIsManualCountdownOpen] = useState(false);
-  const manualTimerRef = useRef<NodeJS.Timeout | null>(null);
   const fallCheckTimerRef = useRef<NodeJS.Timeout | null>(null);
 
 
@@ -268,27 +730,6 @@ function DashboardPage() {
   const [isMedicalProfileOpen, setIsMedicalProfileOpen] = useState(false);
 
   // --- FLASHLIGHT SOS STATE ---
-  const [isFlashSettingsOpen, setIsFlashSettingsOpen] = useState(false);
-  const [flashEnabled, setFlashEnabled] = useState(() => {
-    if (typeof window === 'undefined') return true;
-    const saved = localStorage.getItem('flashEnabled');
-    return saved !== null ? JSON.parse(saved) : true;
-  });
-  const [flashMode, setFlashMode] = useState<'Screen Flash' | 'Torch Simulation'>(() => {
-    if (typeof window === 'undefined') return 'Screen Flash';
-    return (localStorage.getItem('flashMode') as any) || 'Screen Flash';
-  });
-  const [autoFlash, setAutoFlash] = useState(() => {
-    if (typeof window === 'undefined') return true;
-    const saved = localStorage.getItem('autoFlash');
-    return saved !== null ? JSON.parse(saved) : true;
-  });
-  const [flashSpeed, setFlashSpeed] = useState<'Slow' | 'Medium' | 'Fast'>(() => {
-    if (typeof window === 'undefined') return 'Medium';
-    return (localStorage.getItem('flashSpeed') as any) || 'Medium';
-  });
-  const [flashLastActivation, setFlashLastActivation] = useState<string>("Never");
-  const [isFlashing, setIsFlashing] = useState(false);
 
   useEffect(() => { if (typeof window !== 'undefined') localStorage.setItem('flashEnabled', JSON.stringify(flashEnabled)); }, [flashEnabled]);
   useEffect(() => { if (typeof window !== 'undefined') localStorage.setItem('flashMode', flashMode); }, [flashMode]);
@@ -296,21 +737,7 @@ function DashboardPage() {
   useEffect(() => { if (typeof window !== 'undefined') localStorage.setItem('flashSpeed', flashSpeed); }, [flashSpeed]);
 
   // --- SAFE JOURNEY STATE ---
-  const [isJourneyDrawerOpen, setIsJourneyDrawerOpen] = useState(false);
-  const [isProfileDrawerOpen, setIsProfileDrawerOpen] = useState(false);
-  const [journeyDestination, setJourneyDestination] = useState("");
-  const [journeyDuration, setJourneyDuration] = useState<number>(15);
-  
-  const [activeJourney, setActiveJourney] = useState<any>(() => {
-    if (typeof window === 'undefined') return null;
-    const saved = localStorage.getItem('activeJourney');
-    return saved ? JSON.parse(saved) : null;
-  });
-  const [journeyTimeLeft, setJourneyTimeLeft] = useState<number | null>(null);
 
-  const [isEscalationOpen, setIsEscalationOpen] = useState(false);
-  const [escalationCountdown, setEscalationCountdown] = useState<number | null>(null);
-  const escalationTimerRef = useRef<NodeJS.Timeout | null>(null);
   const [distanceToHome, setDistanceToHome] = useState<string | null>(null);
   const [trackingStatus, setTrackingStatus] = useState<string | null>(null);
 
@@ -405,10 +832,19 @@ function DashboardPage() {
   useEffect(() => {
     if (mapMode === 'ROUTE' && routePolyline && routePolyline.length > 0 && currentTelemetry?.latitude) {
       const userPos = { lat: currentTelemetry.latitude, lng: currentTelemetry.longitude };
-      const isOnRoute = routePolyline.some(p => {
+      
+      // OPTIMIZATION: Only check every 5th point if the polyline is large to save CPU
+      const step = routePolyline.length > 100 ? 5 : 1;
+      let isOnRoute = false;
+      
+      for (let i = 0; i < routePolyline.length; i += step) {
+        const p = routePolyline[i];
         const dist = Math.sqrt(Math.pow(p.lat - userPos.lat, 2) + Math.pow(p.lng - userPos.lng, 2));
-        return dist < 0.0005; // Approx 50 meters deviation threshold
-      });
+        if (dist < 0.0005) { // Approx 50 meters
+          isOnRoute = true;
+          break;
+        }
+      }
 
       if (!isOnRoute) {
         logger.log('high', 'Safe Route AI', 'CRITICAL: Route deviation detected');
@@ -416,53 +852,9 @@ function DashboardPage() {
     }
   }, [currentTelemetry, routePolyline, mapMode]);
 
-  const startJourney = async () => {
-    if (!journeyDestination) return;
-    const now = Date.now();
-    const expiresAtLocal = now + journeyDuration * 60 * 1000;
-    
-    const newJourney = {
-      userId: user.uid,
-      destination: journeyDestination,
-      coords: structuredDest ? { lat: structuredDest.lat, lng: structuredDest.lng } : null,
-      expectedArrivalTime: journeyDuration,
-      status: "ACTIVE",
-      expiresAtLocal,
-      startedAtLocal: now
-    };
-    setActiveJourney(newJourney);
-    setIsJourneyDrawerOpen(false);
-    console.log("Safe journey started");
 
-    try {
-      await addDoc(collection(db, "safeJourneys"), {
-        userId: user.uid,
-        destination: journeyDestination,
-        expectedArrivalTime: journeyDuration,
-        status: "ACTIVE",
-        startedAt: serverTimestamp()
-      });
-      logOperational('DB_WRITE', 'Safe Journey persistent node created');
-    } catch (e) {
-      console.error("Safe Journey persistence failed:", e);
-    }
-  };
 
-  const confirmSafeArrival = async () => {
-    setActiveJourney(null);
-    setJourneyTimeLeft(null);
-    setIsEscalationOpen(false);
-    setJourneyDestination("");
-    if (escalationTimerRef.current) clearTimeout(escalationTimerRef.current);
-    console.log("Arrival confirmed");
-  };
 
-  const triggerJourneyEscalation = () => {
-    if (isEscalationOpen) return;
-    console.log("Safe journey escalated - waiting for response");
-    setIsEscalationOpen(true);
-    setEscalationCountdown(30);
-  };
 
   useEffect(() => {
     if (escalationCountdown !== null && escalationCountdown > 0) {
@@ -481,14 +873,14 @@ function DashboardPage() {
 
   // --- MAP ORCHESTRATION ---
 
-  const handleOpenLiveTracking = () => {
+  const handleOpenLiveTracking = useCallback(() => {
     logOperational('HUD_TRANSITION', 'Activating Immersive Tracking');
     setMapMode('TRACKING');
     setIsFullscreenMapOpen(true);
     logger.log('low', 'System HUD', 'Immersive live tracking activated');
-  };
+  }, []);
 
-  const handleViewSafeRoute = () => {
+  const handleViewSafeRoute = useCallback(() => {
     if (!structuredDest) {
       logOperational('HUD_TRANSITION', 'No destination set, opening Safe Route AI modal');
       setIsSafeRouteOpen(true);
@@ -528,9 +920,9 @@ function DashboardPage() {
         }
       }
     );
-  };
+  }, [structuredDest, structuredStart, routesLib, routeAnalysisState, routeIsWalking]);
 
-  const handleNearbyHelp = async () => {
+  const handleNearbyHelp = useCallback(async () => {
     // If telemetry is missing, try to fetch it once before failing
     let telemetryToUse = currentTelemetry;
     if (!telemetryToUse) {
@@ -597,18 +989,60 @@ function DashboardPage() {
         }
       );
     });
-  };
+  }, [currentTelemetry, placesLib, geometryLib, sosActive]);
+
+  const closeAllModals = useCallback(() => {
+    setIsTrustedCircleOpen(false);
+    setIsHiddenSettingsOpen(false);
+    setIsJourneyDrawerOpen(false);
+    setIsSafeRouteOpen(false);
+    setIsShakeSettingsOpen(false);
+    setIsFakeCallSettingsOpen(false);
+    setIsAiThreatOpen(false);
+    setIsFallDetectionOpen(false);
+    setIsMedicalProfileOpen(false);
+    setIsVoiceSettingsOpen(false);
+    setIsProfileDrawerOpen(false);
+  }, []);
+
+  const navigateTo = useCallback((mode: 'IDLE' | 'TRACKING' | 'NETWORK' | 'SETTINGS') => {
+    closeAllModals();
+    if (mode === 'IDLE') setMapMode('IDLE');
+    else if (mode === 'TRACKING') setMapMode('TRACKING');
+    else if (mode === 'NETWORK') setIsTrustedCircleOpen(true);
+    else if (mode === 'SETTINGS') setIsHiddenSettingsOpen(true);
+  }, [closeAllModals]);
+
+  const openShakeSettings = useCallback(() => { closeAllModals(); setIsShakeSettingsOpen(true); }, [closeAllModals]);
+  const openHiddenSettings = useCallback(() => { closeAllModals(); setIsHiddenSettingsOpen(true); }, [closeAllModals]);
+  const openFakeCallSettings = useCallback(() => { closeAllModals(); setIsFakeCallSettingsOpen(true); }, [closeAllModals]);
+  const openSafeRoute = useCallback(() => { closeAllModals(); setIsSafeRouteOpen(true); }, [closeAllModals]);
+  const openJourneyDrawer = useCallback(() => { closeAllModals(); setIsJourneyDrawerOpen(true); }, [closeAllModals]);
+  const openFlashSettings = useCallback(() => { closeAllModals(); setIsFlashSettingsOpen(true); }, [closeAllModals]);
+  const openTrustedCircle = useCallback(() => { closeAllModals(); setIsTrustedCircleOpen(true); }, [closeAllModals]);
+  const openAiThreat = useCallback(() => { closeAllModals(); setIsAiThreatOpen(true); }, [closeAllModals]);
+  const openFallDetection = useCallback(() => { closeAllModals(); setIsFallDetectionOpen(true); }, [closeAllModals]);
+  const openMedicalProfile = useCallback(() => { closeAllModals(); setIsMedicalProfileOpen(true); }, [closeAllModals]);
+  const openVoiceSettings = useCallback(() => { closeAllModals(); setIsVoiceSettingsOpen(true); }, [closeAllModals]);
+  const openProfileDrawer = useCallback(() => { closeAllModals(); setIsProfileDrawerOpen(true); }, [closeAllModals]);
 
   // Auto-refresh nearby nodes if in NEARBY mode
   useEffect(() => {
     if (mapMode !== 'NEARBY' || !isFullscreenMapOpen) return;
     
-    const interval = setInterval(() => {
+    let nearbyTimer: NodeJS.Timeout;
+    
+    const pollNearby = () => {
       logOperational('NEARBY_SCAN', 'Executing scheduled re-scan');
       handleNearbyHelp();
-    }, 30000); // Re-scan every 30 seconds
+      nearbyTimer = setTimeout(pollNearby, 30000);
+    };
     
-    return () => clearInterval(interval);
+    pollNearby();
+    
+    return () => {
+      if (nearbyTimer) clearTimeout(nearbyTimer);
+    };
   }, [mapMode, isFullscreenMapOpen]);
 
   useEffect(() => {
@@ -654,65 +1088,6 @@ function DashboardPage() {
     { name: "High Risk Zone", keywords: ["downtown", "station", "junction", "club"], risk: "MODERATE", reason: "Increased emergency activity reported" }
   ];
 
-  const analyzeRoute = () => {
-    if (!routeStart || !routeDest) return;
-    setRouteAnalysisState('ANALYZING');
-    logger.log('low', 'Safe Route AI', `Geospatial intelligence scan initiated for destination: ${routeDest}`);
-
-    setTimeout(() => {
-      const destLower = routeDest.toLowerCase();
-      const startLower = routeStart.toLowerCase();
-      
-      let calculatedRisk: 'LOW' | 'MODERATE' | 'HIGH' = 'LOW';
-      let matchedZones: any[] = [];
-
-      // Simulated Geospatial Risk Analysis
-      if (structuredDest) {
-        const { lat, lng } = structuredDest;
-        // Mock: High risk if in a specific simulated "Dark Zone" (e.g. lat > 28.7)
-        if (lat > 28.72) {
-          matchedZones.push({ name: "Sector 4 Cluster", reason: "Elevated risk telemetry in target sector", risk: "HIGH" });
-          calculatedRisk = 'HIGH';
-        }
-      }
-
-      for (const zone of UNSAFE_ZONES) {
-        if (zone.keywords.some(k => destLower.includes(k) || startLower.includes(k))) {
-          matchedZones.push(zone);
-          if (zone.risk === 'HIGH') calculatedRisk = 'HIGH';
-          else if (zone.risk === 'MODERATE' && calculatedRisk !== 'HIGH') calculatedRisk = 'MODERATE';
-        }
-      }
-
-      const hour = new Date().getHours();
-      if ((hour >= 22 || hour < 5) && routeIsWalking) {
-        if (calculatedRisk === 'LOW') calculatedRisk = 'MODERATE';
-        matchedZones.push({ reason: "Late-night travel on foot" });
-      }
-
-      setRouteRisk(calculatedRisk);
-      
-      const insights = matchedZones.map(z => z.reason);
-      if (insights.length === 0) insights.push("Route appears safe under current conditions");
-      setRouteInsights(Array.from(new Set(insights)));
-
-      if (calculatedRisk === 'HIGH') {
-        setRouteRecommendation("Safe monitoring recommended for this journey.");
-        setRouteAlternative("Safer alternative available (+12 mins)");
-        logger.log('high', 'Safe Route AI', 'Geospatial risk threshold exceeded: High Risk');
-      } else if (calculatedRisk === 'MODERATE') {
-        setRouteRecommendation("Stay alert. Safer alternatives available.");
-        setRouteAlternative("Alternative route avoiding isolated areas (+5 mins)");
-        logger.log('medium', 'Safe Route AI', 'Route analysis detected moderate risk patterns');
-      } else {
-        setRouteRecommendation("Standard safety precautions apply.");
-        setRouteAlternative("");
-        logger.log('low', 'Safe Route AI', 'Geospatial scan completed - Safe passage predicted');
-      }
-
-      setRouteAnalysisState('RESULT');
-    }, 2500);
-  };
 
   const startJourneyFromRoute = () => {
     setJourneyDestination(routeDest);
@@ -744,7 +1119,7 @@ function DashboardPage() {
     }
   }, [aiRiskLevel, prevRiskLevel]);
 
-  const activeSignals = (() => {
+  const activeSignals = useMemo(() => {
     const signals = [];
     if (sosActive) signals.push({ text: 'Active emergency triggered', severity: 'High' });
     if (isEscalationOpen) signals.push({ text: 'Journey timeout risk', severity: 'High' });
@@ -755,9 +1130,9 @@ function DashboardPage() {
     if (routeRisk === 'HIGH' || routeRisk === 'MODERATE') signals.push({ text: 'Active unsafe route analysis', severity: routeRisk === 'HIGH' ? 'High' : 'Medium' });
     if (gpsFailCount > 1) signals.push({ text: 'Location telemetry unstable', severity: 'Medium' });
     return signals;
-  })();
+  }, [sosActive, isEscalationOpen, activeJourney, journeyTimeLeft, contacts.length, routeRisk, gpsFailCount]);
 
-  const aiInsights = (() => {
+  const aiInsights = useMemo(() => {
     const insights = [];
     if (aiRiskLevel === 'High') {
       insights.push('Emergency escalation recommended');
@@ -771,7 +1146,7 @@ function DashboardPage() {
       insights.push('System armed and monitoring');
     }
     return insights;
-  })();
+  }, [aiRiskLevel, contacts.length, activeJourney]);
 
   useEffect(() => {
     if (isAiThreatOpen) {
@@ -781,84 +1156,9 @@ function DashboardPage() {
     }
   }, [isAiThreatOpen]);
 
-  // --- VOICE RECORDING STATE ---
-  const [isVoiceSettingsOpen, setIsVoiceSettingsOpen] = useState(false);
-  const [voiceEnabled, setVoiceEnabled] = useState(() => {
-    if (typeof window === 'undefined') return true;
-    const saved = localStorage.getItem('voiceEnabled');
-    return saved !== null ? JSON.parse(saved) : true;
-  });
-  const [autoRecord, setAutoRecord] = useState(() => {
-    if (typeof window === 'undefined') return true;
-    const saved = localStorage.getItem('autoRecord');
-    return saved !== null ? JSON.parse(saved) : true;
-  });
-  const [voiceQuality, setVoiceQuality] = useState<'Low' | 'Medium' | 'High'>(() => {
-    if (typeof window === 'undefined') return 'Medium';
-    return (localStorage.getItem('voiceQuality') as any) || 'Medium';
-  });
-  const [voiceMaxLength, setVoiceMaxLength] = useState<'30 Seconds' | '1 Minute' | '5 Minutes' | 'Unlimited'>(() => {
-    if (typeof window === 'undefined') return 'Unlimited';
-    return (localStorage.getItem('voiceMaxLength') as any) || 'Unlimited';
-  });
-  const [autoEvidenceUpload, setAutoEvidenceUpload] = useState(() => {
-    if (typeof window === 'undefined') return true;
-    const saved = localStorage.getItem('autoEvidenceUpload');
-    return saved !== null ? JSON.parse(saved) : true;
-  });
-  const [voiceLastRecording, setVoiceLastRecording] = useState<string>("Never");
 
-  const [isRecording, setIsRecording] = useState(false);
-  const [recordingSeconds, setRecordingSeconds] = useState(0);
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const audioChunksRef = useRef<BlobPart[]>([]);
-  const currentEmergencyIdRef = useRef<string | null>(null);
-  const recordingTimerRef = useRef<NodeJS.Timeout | null>(null);
 
-  // --- FALL DETECTION STATE ---
-  const [isFallEscalating, setIsFallEscalating] = useState(false);
-  const [fallCountdown, setFallCountdown] = useState<number | null>(null);
-  const fallTimerRef = useRef<NodeJS.Timeout | null>(null);
 
-  useEffect(() => { if (typeof window !== 'undefined') localStorage.setItem('voiceEnabled', JSON.stringify(voiceEnabled)); }, [voiceEnabled]);
-  useEffect(() => { if (typeof window !== 'undefined') localStorage.setItem('autoRecord', JSON.stringify(autoRecord)); }, [autoRecord]);
-  useEffect(() => { if (typeof window !== 'undefined') localStorage.setItem('autoEvidenceUpload', JSON.stringify(autoEvidenceUpload)); }, [autoEvidenceUpload]);
-  useEffect(() => { if (typeof window !== 'undefined') localStorage.setItem('voiceQuality', voiceQuality); }, [voiceQuality]);
-  useEffect(() => { if (typeof window !== 'undefined') localStorage.setItem('voiceMaxLength', voiceMaxLength); }, [voiceMaxLength]);
-
-  const startRecording = async (emergencyId: string | null = null) => {
-    if (isRecording || !voiceEnabled || !emergencyId) return;
-    
-    setIsRecording(true);
-    setRecordingSeconds(0);
-    evidenceService.startRecording(emergencyId);
-    
-    recordingTimerRef.current = setInterval(() => {
-      setRecordingSeconds(prev => {
-        const next = prev + 1;
-        
-        let maxSeconds = Infinity;
-        if (voiceMaxLength === '30 Seconds') maxSeconds = 30;
-        if (voiceMaxLength === '1 Minute') maxSeconds = 60;
-        if (voiceMaxLength === '5 Minutes') maxSeconds = 300;
-
-        if (next >= maxSeconds) {
-          stopRecording();
-        }
-        return next;
-      });
-    }, 1000);
-  };
-
-  const stopRecording = () => {
-    evidenceService.stopRecording();
-    setIsRecording(false);
-    if (recordingTimerRef.current) {
-      clearInterval(recordingTimerRef.current);
-      recordingTimerRef.current = null;
-    }
-    setVoiceLastRecording(new Date().toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'}));
-  };
 
   // --- TRUSTED CIRCLE LOGIC ---
   useEffect(() => {
@@ -970,103 +1270,9 @@ function DashboardPage() {
     }
   };
 
-  // --- GENERIC EMERGENCY PIPELINE ---
-  const finalizeSOS = async (telemetry: any, triggerType: "SHAKE_SOS" | "HIDDEN_SOS" | "MANUAL_SOS" | "SAFE_JOURNEY_ESCALATION" | "FALL_DETECTION") => {
-    setIsFetchingLocation(false);
-    setIsEmergencyCountdownOpen(false);
-    setIsHiddenCountdownOpen(false);
-    setSosActive(true);
-    
-    const timeStr = new Date().toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
-    if (triggerType === "SHAKE_SOS") setLastActivation(timeStr);
-    if (triggerType === "HIDDEN_SOS") setHiddenLastActivation(timeStr);
-    
-    if (flashEnabled && autoFlash) {
-      logger.log('medium', 'Flashlight SOS', 'Auto SOS beacon armed');
-      setIsFlashing(true);
-      setFlashLastActivation(timeStr);
-    }
 
-    if (!navigator.onLine) {
-      logOperational('OFFLINE_MODE', 'Network uplink lost. Queuing SOS payload for retry...');
-      localStorage.setItem('emergency_queue', JSON.stringify({ telemetry, type: triggerType, timestamp: Date.now() }));
-      logger.log('high', 'System', 'Offline SOS queued');
-      return;
-    }
 
-    const sessionId = await emergencyService.createEmergencySession(triggerType, telemetry);
-    
-    if (sessionId) {
-      setActiveSessionId(sessionId);
-      if (voiceEnabled && autoRecord) {
-        logger.log('medium', 'Voice Recording', 'Auto-recording triggered');
-        startRecording(sessionId);
-      }
-      
-      // Initiation Log
-      logger.log('high', 'Emergency Orchestration', 'Awaiting verified guardian acknowledgements (Cloud Orchestration Active)');
-    }
-  };
 
-  const handleResolveEmergency = async () => {
-    if (activeSessionId) {
-      await emergencyService.resolveEmergency(activeSessionId);
-      logger.log('info', 'Emergency Orchestration', 'Emergency resolved successfully');
-    }
-    setSosActive(false);
-    setActiveSessionId(null);
-    setIsFlashing(false);
-    if (isRecording) stopRecording();
-  };
-
-  const handleFalseAlarm = async () => {
-    if (activeSessionId) {
-      await emergencyService.markFalseAlarm(activeSessionId);
-      logger.log('info', 'Emergency Orchestration', 'False alarm marked by user');
-    }
-    setSosActive(false);
-    setActiveSessionId(null);
-    setIsFlashing(false);
-    if (isRecording) stopRecording();
-  };
-
-  const activateEmergency = async (type: "SHAKE_SOS" | "HIDDEN_SOS" | "MANUAL_SOS" | "SAFE_JOURNEY_ESCALATION" | "FALL_DETECTION") => {
-    if (type === "SHAKE_SOS") {
-      logOperational('SOS', 'Motion-triggered alert. Synchronizing systems...');
-      setEmergencyCountdown(null);
-    }
-    if (type === "HIDDEN_SOS") {
-      logOperational('SOS', 'Silent alert confirmed. Initiating secure sync...');
-      setHiddenCountdown(null);
-    }
-    if (type === "FALL_DETECTION") {
-      logOperational('SOS', 'Fall detected. Coordinating emergency response...');
-      setFallCountdown(null);
-      setIsFallEscalating(false);
-    }
-    if (type === "MANUAL_SOS") {
-      logOperational('SOS', 'Manual SOS confirmed. Verifying location...');
-      setManualCountdown(null);
-      setIsManualCountdownOpen(false);
-    }
-    
-    setIsFetchingLocation(true);
-    
-    try {
-      const telemetry = await locationService.getEmergencyTelemetry(2);
-      finalizeSOS(telemetry, type);
-    } catch (e) {
-      console.warn("Location Service failed entirely", e);
-      finalizeSOS({
-        latitude: 12.9716, 
-        longitude: 77.5946, 
-        accuracy: null, 
-        stale: true, 
-        fallbackUsed: true,
-        locationState: "UNAVAILABLE"
-      }, type);
-    }
-  };
 
   // --- SHAKE ENGINE ---
   useEffect(() => {
@@ -1108,29 +1314,7 @@ function DashboardPage() {
     return () => window.removeEventListener('devicemotion', handleMotion);
   }, [shakeEnabled, shakeSensitivity, isEmergencyCountdownOpen, sosActive]);
 
-  const triggerShakeEmergency = () => {
-    logOperational('TIMER', 'Shake countdown initiated (3s)');
-    setIsEmergencyCountdownOpen(true);
-    setEmergencyCountdown(3); // Standardized 3s for shake
-    if (window.navigator.vibrate) window.navigator.vibrate([200, 100, 200]);
-  };
 
-  useEffect(() => {
-    if (emergencyCountdown !== null && emergencyCountdown > 0) {
-      emergencyTimerRef.current = setTimeout(() => setEmergencyCountdown(emergencyCountdown - 1), 1000);
-    } else if (emergencyCountdown === 0 && isEmergencyCountdownOpen) {
-      activateEmergency("SHAKE_SOS");
-    }
-    return () => {
-      if (emergencyTimerRef.current) clearTimeout(emergencyTimerRef.current);
-    };
-  }, [emergencyCountdown, isEmergencyCountdownOpen]);
-
-  const cancelShakeEmergency = () => {
-    setIsEmergencyCountdownOpen(false);
-    setEmergencyCountdown(null);
-    if (emergencyTimerRef.current) clearTimeout(emergencyTimerRef.current);
-  };
 
   // --- FALL DETECTION ENGINE ---
   useEffect(() => {
@@ -1162,31 +1346,7 @@ function DashboardPage() {
     return () => window.removeEventListener('devicemotion', handleFallMotion);
   }, [fallDetectionEnabled, isFallEscalating, isEmergencyCountdownOpen, sosActive]);
 
-  const triggerFallEmergency = () => {
-    logOperational('TIMER', 'Fall escalation initiated (15s)');
-    setIsFallEscalating(true);
-    setFallCountdown(15);
-    if (window.navigator.vibrate) window.navigator.vibrate([500, 500, 500]);
-    logger.log('medium', 'Fall Detection', 'Possible fall detected - waiting for response');
-  };
 
-  useEffect(() => {
-    if (fallCountdown !== null && fallCountdown > 0) {
-      fallTimerRef.current = setTimeout(() => setFallCountdown(fallCountdown - 1), 1000);
-    } else if (fallCountdown === 0 && isFallEscalating) {
-      activateEmergency("FALL_DETECTION");
-    }
-    return () => {
-      if (fallTimerRef.current) clearTimeout(fallTimerRef.current);
-    };
-  }, [fallCountdown, isFallEscalating]);
-
-  const cancelFallEmergency = () => {
-    setIsFallEscalating(false);
-    setFallCountdown(null);
-    if (fallTimerRef.current) clearTimeout(fallTimerRef.current);
-    logger.log('info', 'Fall Detection', 'Fall escalation cancelled by user');
-  };
 
   // --- HIDDEN SOS ENGINE ---
   const getHiddenThresholds = () => {
@@ -1213,11 +1373,7 @@ function DashboardPage() {
     }
 
     if (newCount >= taps) {
-      logOperational('TIMER', 'Hidden gesture confirmed. Discreet countdown (3s)');
-      setIsHiddenCountdownOpen(true);
-      setHiddenCountdown(3);
-      setLogoTapCount(0);
-      if (window.navigator.vibrate) window.navigator.vibrate([100]);
+      triggerHiddenEmergency();
     }
   };
 
@@ -1232,51 +1388,11 @@ function DashboardPage() {
     };
   }, [hiddenCountdown, isHiddenCountdownOpen]);
 
-  const cancelHiddenEmergency = () => {
-    setIsHiddenCountdownOpen(false);
-    setHiddenCountdown(null);
-    setLogoTapCount(0);
-    if (hiddenTimerRef.current) clearTimeout(hiddenTimerRef.current);
-  };
 
-  // --- MANUAL SOS ---
-  const startSOS = () => {
-    if (sosActive || isManualCountdownOpen) {
-      if (sosActive) {
-        logOperational('SOS', 'Active session detected. Termination initiated.');
-        setSosActive(false);
-        setIsFlashing(false);
-        stopRecording();
-      }
-      return;
-    }
-    logOperational('TIMER', 'SOS request initiated. Preparing systems...');
-    setManualCountdown(3);
-    setIsManualCountdownOpen(true);
-    if (window.navigator.vibrate) window.navigator.vibrate([100, 50, 100]);
-  };
 
-  useEffect(() => {
-    if (manualCountdown !== null && manualCountdown > 0) {
-      manualTimerRef.current = setTimeout(() => setManualCountdown(manualCountdown - 1), 1000);
-    } else if (manualCountdown === 0 && isManualCountdownOpen) {
-      activateEmergency("MANUAL_SOS");
-    }
-    return () => {
-      if (manualTimerRef.current) clearTimeout(manualTimerRef.current);
-    };
-  }, [manualCountdown, isManualCountdownOpen]);
 
-  const abortSOS = () => {
-    if (isManualCountdownOpen) {
-      logOperational('TIMER', 'Manual SOS aborted before trigger.');
-    }
-    setManualCountdown(null);
-    setIsManualCountdownOpen(false);
-    if (manualTimerRef.current) clearTimeout(manualTimerRef.current);
-  };
 
-  if (authLoading || !user) {
+  if (authLoading || !user || isRecovering) {
     return (
       <div className="min-h-screen bg-[#050507] flex flex-col items-center justify-center gap-6">
         <div className="w-16 h-16 rounded-2xl bg-crimson-glow/10 border border-white/5 flex items-center justify-center animate-pulse">
@@ -1287,10 +1403,14 @@ function DashboardPage() {
     );
   }
 
+
   return (
-    <div className="min-h-screen bg-[#050507] text-silver font-display overflow-x-hidden pb-28">
+    <div className="min-h-screen bg-[#050507] text-silver font-display overflow-x-hidden pb-[env(safe-area-inset-bottom,112px)]">
       {/* Soft Ambient Background */}
-      <div className="fixed inset-0 bg-[radial-gradient(circle_at_50%_0%,oklch(0.18_0.08_22_/_0.15)_0%,transparent_70%)] pointer-events-none" />
+      <div 
+        className="fixed inset-0 bg-[radial-gradient(circle_at_50%_0%,oklch(0.18_0.08_22_/_0.15)_0%,transparent_70%)] pointer-events-none transition-opacity duration-1000" 
+        style={{ opacity: motionProfile.glowOpacity }}
+      />
 
       {/* GLOBAL SYSTEM STATUS BAR */}
       <div className="sticky top-0 z-[60] bg-[#050507] border-b border-white/5 py-1.5 px-4 md:px-8 flex items-center justify-between overflow-x-auto hide-scrollbar">
@@ -1300,17 +1420,25 @@ function DashboardPage() {
          </div>
          <div className="flex items-center gap-4 shrink-0 ml-4">
            <div className="flex items-center gap-1.5">
-             <div className="w-1.5 h-1.5 rounded-full bg-green-500 shadow-[0_0_5px_rgba(34,197,94,0.5)]" />
-             <span className="text-[9px] tracking-wider uppercase text-silver/40">Firebase Connected</span>
+             <div className={`w-1.5 h-1.5 rounded-full ${isOnline ? 'bg-green-500 shadow-[0_0_5px_rgba(34,197,94,0.5)]' : 'bg-amber-500 animate-pulse shadow-[0_0_5px_rgba(245,158,11,0.5)]'}`} />
+             <span className="text-[9px] tracking-wider uppercase text-silver/40">{isOnline ? 'Firebase Connected' : 'Offline Mode (Queue Active)'}</span>
            </div>
            <div className="flex items-center gap-1.5">
              <div className="w-1.5 h-1.5 rounded-full bg-green-500 shadow-[0_0_5px_rgba(34,197,94,0.5)]" />
              <span className="text-[9px] tracking-wider uppercase text-silver/40">Voice Evidence Ready</span>
            </div>
-           <div className="flex items-center gap-1.5">
-             <div className="w-1.5 h-1.5 rounded-full bg-green-500 shadow-[0_0_5px_rgba(34,197,94,0.5)]" />
-             <span className="text-[9px] tracking-wider uppercase text-silver/40">GPS Services Online</span>
-           </div>
+            <div className="flex items-center gap-1.5">
+              <div className={`w-1.5 h-1.5 rounded-full ${gpsActive ? 'bg-green-500 shadow-[0_0_5px_rgba(34,197,94,0.5)]' : 'bg-red-500 shadow-[0_0_5px_rgba(239,68,68,0.5)]'}`} />
+              <span className="text-[9px] tracking-wider uppercase text-silver/40">GPS Services {gpsActive ? 'Online' : 'Offline'}</span>
+            </div>
+            {lastUpdated && (
+              <div className="flex items-center gap-1.5 border-l border-white/10 pl-4 ml-1 shrink-0">
+                <div className="w-1 h-1 rounded-full bg-blue-400/40 animate-pulse" />
+                <span className="text-[8px] tracking-[0.2em] uppercase text-silver/20 font-mono">
+                  Sync: {lastUpdated.toLocaleTimeString([], { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+                </span>
+              </div>
+            )}
          </div>
       </div>
 
@@ -1321,7 +1449,7 @@ function DashboardPage() {
             className="flex items-center gap-2 cursor-pointer select-none"
             onClick={handleLogoTap}
           >
-            <Shield className="w-4 h-4 text-crimson-glow" />
+            <Shield className="w-4 h-4 text-crimson-glow" style={{ opacity: motionProfile.glowOpacity }} />
             <span className="text-[11px] font-medium tracking-widest uppercase text-silver">{sosActive ? 'Emergency Mode ON' : 'Safe Mode'}</span>
           </div>
           <div className="hidden md:flex items-center gap-2 px-3 py-1 bg-white/5 rounded-full">
@@ -1362,10 +1490,15 @@ function DashboardPage() {
         </div>
       </header>
 
-      <main className="relative z-10 max-w-5xl mx-auto px-4 md:px-8 pt-10 space-y-16">
+      <motion.main 
+        variants={motionProfile.containerVariants}
+        initial="hidden"
+        animate="visible"
+        className="max-w-7xl mx-auto px-4 md:px-8 py-8 space-y-12 relative z-10"
+      >
         
-        {/* MAIN HERO SECTION - SOS */}
-        <section className="flex flex-col items-center justify-center">
+        {/* HERO SOS SECTION */}
+        <motion.section variants={motionProfile.itemVariants} className="flex flex-col items-center justify-center py-10 md:py-20 relative overflow-hidden">
           <div className="relative group">
             {/* Soft Radar Ripple */}
             <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 pointer-events-none">
@@ -1376,10 +1509,10 @@ function DashboardPage() {
             {/* Cinematic SOS Button */}
             <motion.button
               whileHover={{ scale: 1.02 }}
-              whileTap={{ scale: 0.98 }}
+              whileTap={{ scale: motionProfile.tapScale }}
               onPointerDown={startSOS}
-              onPointerUp={abortSOS}
-              onPointerLeave={abortSOS}
+              onPointerUp={cancelSOS}
+              onPointerLeave={cancelSOS}
               className={`relative z-10 w-56 h-56 md:w-64 md:h-64 rounded-full flex flex-col items-center justify-center gap-3 transition-all duration-500 shadow-2xl ${
                 sosActive 
                   ? "bg-crimson-glow shadow-[0_0_100px_oklch(0.58_0.24_22_/_0.8)]" 
@@ -1412,20 +1545,22 @@ function DashboardPage() {
             <StatusChip label="SMS Backup Ready" active />
             <StatusChip label="AI Safe Mode" active />
           </div>
-        </section>
+        </motion.section>
 
         {/* LIVE MAP SECTION */}
-        <section className="space-y-5">
+        <motion.section variants={motionProfile.itemVariants} className="space-y-5">
           <h2 className="text-[11px] font-bold uppercase tracking-widest text-silver/60">Live Location</h2>
           <div className="glass-panel rounded-[2rem] overflow-hidden h-[350px] relative border-white/5 shadow-2xl">
             <div className="absolute inset-0 opacity-40">
-              <GMap sosActive={sosActive} destination={structuredDest ? { lat: structuredDest.lat, lng: structuredDest.lng } : undefined} />
+              <LocalizedErrorBoundary>
+                <GMap sosActive={sosActive} destination={structuredDest ? { lat: structuredDest.lat, lng: structuredDest.lng } : undefined} />
+              </LocalizedErrorBoundary>
             </div>
             
             <div className="absolute inset-0 bg-gradient-to-t from-black/80 via-black/20 to-transparent pointer-events-none" />
             <div className="absolute top-4 left-4 right-4 flex flex-col gap-2 pointer-events-none">
                <div className="bg-black/60 backdrop-blur-md px-4 py-2 rounded-full border border-white/10 w-fit flex items-center gap-2">
-                 <div className={`w-2 h-2 rounded-full ${gpsActive ? 'bg-green-500 shadow-[0_0_8px_rgba(34,197,94,0.8)]' : 'bg-red-500 shadow-[0_0_8px_rgba(239,68,68,0.8)]'} animate-pulse`} />
+                 <div className={`w-1.5 h-1.5 rounded-full ${gpsActive ? 'bg-green-500 shadow-[0_0_8px_rgba(34,197,94,0.4)]' : 'bg-red-500 shadow-[0_0_8px_rgba(239,68,68,0.4)]'}`} />
                  <span className="text-[10px] uppercase tracking-widest text-white font-bold">{gpsStatus}</span>
                </div>
                {sosActive && (
@@ -1436,15 +1571,16 @@ function DashboardPage() {
                )}
             </div>
             <div className="absolute bottom-6 left-6 right-6 flex flex-wrap gap-3">
-              <MapButton label="Open Live Tracking" primary onClick={handleOpenLiveTracking} />
-              <MapButton label="View Safe Route" onClick={handleViewSafeRoute} />
+              <MapButton label="Open Live Tracking" primary onClick={handleOpenLiveTracking} tapScale={motionProfile.tapScale} />
+              <MapButton label="View Safe Route" onClick={handleViewSafeRoute} tapScale={motionProfile.tapScale} />
               <MapButton 
                 label={isSearchingNearby ? "Scanning..." : "Nearby Help"} 
                 onClick={handleNearbyHelp} 
+                tapScale={motionProfile.tapScale}
               />
             </div>
           </div>
-        </section>
+        </motion.section>
 
         {/* ACTIVE EMERGENCY PANEL */}
         <AnimatePresence>
@@ -1482,31 +1618,77 @@ function DashboardPage() {
                   </div>
                 </div>
 
-                {/* TRUSTED CIRCLE TELEMETRY STATUS */}
-                <div className="mb-8 p-4 bg-white/5 rounded-2xl border border-white/5">
-                  <p className="text-[10px] text-silver/40 uppercase tracking-[0.2em] font-bold mb-4">Trusted Circle Coordination Telemetry</p>
-                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-                    <div className="flex items-center gap-3">
-                      <div className="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse" />
-                      <div>
-                        <p className="text-[10px] text-white font-medium uppercase tracking-wider">Mom</p>
-                        <p className="text-[8px] text-silver/50 uppercase tracking-widest">Viewing live telemetry</p>
-                      </div>
+                {/* COORDINATED RESPONSE PIPELINE */}
+                <div className="mb-8 p-6 bg-white/5 rounded-3xl border border-white/5">
+                  <div className="flex items-center justify-between mb-6">
+                    <div className="flex flex-col">
+                      <p className="text-[10px] text-silver/40 uppercase tracking-[0.2em] font-bold">Emergency Operations</p>
+                      <p className="text-[9px] text-silver/20 uppercase tracking-widest mt-1">Coordinated Response in Progress</p>
                     </div>
-                    <div className="flex items-center gap-3">
-                      <div className="w-1.5 h-1.5 rounded-full bg-silver/20" />
-                      <div>
-                        <p className="text-[10px] text-silver/60 font-medium uppercase tracking-wider">Dad</p>
-                        <p className="text-[8px] text-silver/30 uppercase tracking-widest">Standby • Signal active</p>
-                      </div>
+                    <div className="flex items-center gap-3 bg-white/5 px-3 py-1.5 rounded-full border border-white/5">
+                      <div className={`w-1.5 h-1.5 rounded-full ${telegramStatus === 'SENT' ? 'bg-green-500 shadow-[0_0_8px_rgba(34,197,94,0.5)]' : telegramStatus === 'FAILED' ? 'bg-amber-500 animate-pulse' : 'bg-blue-500 animate-pulse'}`} />
+                      <span className="text-[9px] font-bold uppercase tracking-widest text-silver/60">
+                        {telegramStatus === 'SENT' ? 'Guardians Notified' : telegramStatus === 'FAILED' ? 'Secure Retry Active' : 'Dispatching Alerts...'}
+                      </span>
                     </div>
-                    <div className="flex items-center gap-3">
-                      <div className="w-1.5 h-1.5 rounded-full bg-crimson-glow animate-pulse" />
-                      <div>
-                        <p className="text-[10px] text-crimson-glow font-medium uppercase tracking-wider">Police Dispatch</p>
-                        <p className="text-[8px] text-crimson-glow/60 uppercase tracking-widest">Escalation in progress</p>
+                  </div>
+                  
+                  {/* EMOTIONAL PROGRESS STEPS */}
+                  <div className="space-y-4 mb-8">
+                    <div className="flex items-center gap-4">
+                      <div className="w-4 h-4 rounded-full border border-green-500/30 flex items-center justify-center shrink-0 bg-green-500/10">
+                        <div className="w-1.5 h-1.5 rounded-full bg-green-500" />
                       </div>
+                      <p className="text-[10px] text-silver/80 font-medium uppercase tracking-wider">Emergency Session Secured</p>
                     </div>
+                    <div className="flex items-center gap-4">
+                      <div className="w-4 h-4 rounded-full border border-green-500/30 flex items-center justify-center shrink-0 bg-green-500/10">
+                        <div className="w-1.5 h-1.5 rounded-full bg-green-500" />
+                      </div>
+                      <p className="text-[10px] text-silver/80 font-medium uppercase tracking-wider">Live Telemetry Sharing Active</p>
+                    </div>
+                    <div className="flex items-center gap-4">
+                      <div className={`w-4 h-4 rounded-full border ${telegramStatus === 'SENT' ? 'border-green-500/30 bg-green-500/10' : 'border-white/10'} flex items-center justify-center shrink-0`}>
+                        <div className={`w-1.5 h-1.5 rounded-full ${telegramStatus === 'SENT' ? 'bg-green-500' : 'bg-white/20 animate-pulse'}`} />
+                      </div>
+                      <p className={`text-[10px] uppercase tracking-wider ${telegramStatus === 'SENT' ? 'text-silver/80 font-medium' : 'text-silver/30'}`}>
+                        {telegramStatus === 'SENT' ? 'Trusted Circle Alerted' : 'Contacting Trusted Circle...'}
+                      </p>
+                    </div>
+
+                    {Object.keys(activeAcknowledgements).length > 0 && (
+                      <div className="flex items-center gap-4">
+                        <div className="w-4 h-4 rounded-full border border-green-500/30 flex items-center justify-center shrink-0 bg-green-500/10">
+                          <div className="w-1.5 h-1.5 rounded-full bg-green-500" />
+                        </div>
+                        <p className="text-[10px] text-green-400 font-bold uppercase tracking-wider flex items-center gap-2">
+                          Verified Guardian Activity Detected
+                          <span className="text-[8px] text-silver/40 font-normal">({Object.keys(activeAcknowledgements).length} Responders)</span>
+                        </p>
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 pt-4 border-t border-white/5">
+                    {Object.values(activeAcknowledgements).length > 0 ? (
+                      Object.values(activeAcknowledgements).map((ack: any) => (
+                        <div key={ack.guardianId} className="flex items-center gap-3 bg-green-500/5 p-3 rounded-2xl border border-green-500/10">
+                          <div className="w-2 h-2 rounded-full bg-green-500 shadow-[0_0_10px_rgba(34,197,94,0.4)]" />
+                          <div>
+                            <p className="text-[10px] text-white font-bold uppercase tracking-wider">{ack.guardianName} is responding</p>
+                            <p className="text-[8px] text-green-400/60 uppercase tracking-widest font-medium">Verified Response Received</p>
+                          </div>
+                        </div>
+                      ))
+                    ) : (
+                      <div className="flex items-center gap-3 bg-white/5 p-3 rounded-2xl border border-white/5 opacity-60">
+                        <div className="w-2 h-2 rounded-full bg-amber-500/50 animate-pulse" />
+                        <div>
+                          <p className="text-[10px] text-silver/60 font-bold uppercase tracking-wider">Awaiting Guardian Response</p>
+                          <p className="text-[8px] text-silver/30 uppercase tracking-widest">Awaiting first acknowledgement</p>
+                        </div>
+                      </div>
+                    )}
                   </div>
                 </div>
                 <div className="flex flex-col sm:flex-row gap-3">
@@ -1523,7 +1705,7 @@ function DashboardPage() {
         </AnimatePresence>
 
         {/* SAFETY FEATURES SECTION */}
-        <section className="space-y-8">
+        <motion.section variants={motionProfile.itemVariants} className="space-y-8">
           <div>
             <h2 className="text-[11px] font-bold uppercase tracking-widest text-silver/60 mb-4">Emergency Triggers</h2>
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
@@ -1532,21 +1714,27 @@ function DashboardPage() {
                 desc="Trigger SOS by shaking your phone" 
                 icon={<Smartphone />} 
                 active={shakeEnabled} 
-                onClick={() => setIsShakeSettingsOpen(true)} 
+                onClick={openShakeSettings} 
+                tapScale={motionProfile.tapScale}
+                pulseOpacity={motionProfile.pulseOpacity}
               />
               <FeatureCard 
                 title="Hidden SOS" 
                 desc="Secret emergency activation" 
                 icon={<EyeOff />} 
                 active={hiddenEnabled}
-                onClick={() => setIsHiddenSettingsOpen(true)}
+                onClick={openHiddenSettings}
+                tapScale={motionProfile.tapScale}
+                pulseOpacity={motionProfile.pulseOpacity}
               />
               <FeatureCard 
                 title="Fake Call Escape" 
                 desc="Simulate an incoming call" 
                 icon={<Phone />} 
                 active={fakeCallEnabled}
-                onClick={() => setIsFakeCallSettingsOpen(true)}
+                onClick={openFakeCallSettings}
+                tapScale={motionProfile.tapScale}
+                pulseOpacity={motionProfile.pulseOpacity}
               />
             </div>
           </div>
@@ -1559,21 +1747,27 @@ function DashboardPage() {
                 desc="Avoid unsafe and isolated roads" 
                 icon={<MapPin />} 
                 active={true} 
-                onClick={() => setIsSafeRouteOpen(true)}
+                onClick={openSafeRoute}
+                tapScale={motionProfile.tapScale}
+                pulseOpacity={motionProfile.pulseOpacity}
               />
               <FeatureCard 
                 title="Reach Home Safe" 
                 desc="Auto-alert if you don't reach safely" 
                 icon={<Home />} 
                 active={activeJourney !== null}
-                onClick={() => setIsJourneyDrawerOpen(true)}
+                onClick={openJourneyDrawer}
+                tapScale={motionProfile.tapScale}
+                pulseOpacity={motionProfile.pulseOpacity}
               />
               <FeatureCard 
                 title="Flashlight SOS" 
                 desc="Emergency flashing light for visibility" 
                 icon={<Flashlight />} 
                 active={flashEnabled} 
-                onClick={() => setIsFlashSettingsOpen(true)}
+                onClick={openFlashSettings}
+                tapScale={motionProfile.tapScale}
+                pulseOpacity={motionProfile.pulseOpacity}
               />
             </div>
           </div>
@@ -1586,21 +1780,36 @@ function DashboardPage() {
                 desc="Connected family & trusted contacts" 
                 icon={<Users />} 
                 active={contacts.length > 0} 
-                onClick={() => setIsTrustedCircleOpen(true)} 
+                onClick={openTrustedCircle} 
+                tapScale={motionProfile.tapScale}
+                pulseOpacity={motionProfile.pulseOpacity}
               />
               <FeatureCard 
-                title="AI Threat Detection" 
-                desc="Telemetry and risk orchestration" 
-                icon={<Cpu />} 
+                title="AI Intelligence" 
+                desc="Real-time threat & risk analysis" 
+                icon={<Brain />} 
                 active={true} 
-                onClick={() => setIsAiThreatOpen(true)}
+                onClick={openAiThreat}
+                tapScale={motionProfile.tapScale}
+                pulseOpacity={motionProfile.pulseOpacity}
+              />
+              <FeatureCard 
+                title="Medical Profile" 
+                desc="Critical health info for responders" 
+                icon={<Activity />} 
+                active={medicalProfileActive} 
+                onClick={openMedicalProfile}
+                tapScale={motionProfile.tapScale}
+                pulseOpacity={motionProfile.pulseOpacity}
               />
               <FeatureCard 
                 title="Fall Detection" 
                 desc="Detects possible falls and inactivity" 
                 icon={<Activity />} 
                 active={fallDetectionEnabled} 
-                onClick={() => setIsFallDetectionOpen(true)}
+                onClick={openFallDetection}
+                tapScale={motionProfile.tapScale}
+                pulseOpacity={motionProfile.pulseOpacity}
               />
             </div>
           </div>
@@ -1613,18 +1822,22 @@ function DashboardPage() {
                 desc="Emergency conditions and allergies" 
                 icon={<Shield />} 
                 active={medicalProfileActive} 
-                onClick={() => setIsMedicalProfileOpen(true)}
+                onClick={openMedicalProfile}
+                tapScale={motionProfile.tapScale}
+                pulseOpacity={motionProfile.pulseOpacity}
               />
               <FeatureCard 
                 title="Voice Recording" 
                 desc="Secure emergency evidence recording" 
                 icon={<Mic />} 
                 active={voiceEnabled} 
-                onClick={() => setIsVoiceSettingsOpen(true)}
+                onClick={openVoiceSettings}
+                tapScale={motionProfile.tapScale}
+                pulseOpacity={motionProfile.pulseOpacity}
               />
             </div>
           </div>
-        </section>
+        </motion.section>
 
         {/* TRUSTED CIRCLE & TIMELINE */}
         <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
@@ -1636,7 +1849,10 @@ function DashboardPage() {
             <div className="glass-panel p-2 rounded-[2rem] border-white/5 space-y-1 bg-black/40">
               <AnimatePresence mode="popLayout">
                 {guardians.length === 0 && (
-                  <p className="text-[10px] uppercase tracking-widest text-silver/20 text-center py-6">No guardians configured</p>
+                  <div className="space-y-3 p-4">
+                    <Skeleton className="w-full h-12 rounded-xl" opacity={motionProfile.shimmerOpacity} />
+                    <Skeleton className="w-3/4 h-12 rounded-xl" opacity={motionProfile.shimmerOpacity} />
+                  </div>
                 )}
                 {guardians.map((g) => (
                   <motion.div
@@ -1654,6 +1870,7 @@ function DashboardPage() {
                         lastActive: activeAcknowledgements[g.id]?.lastActive || null
                       }}
                       sosActive={sosActive}
+                      tapScale={motionProfile.tapScale}
                     />
                   </motion.div>
                 ))}
@@ -1703,67 +1920,50 @@ function DashboardPage() {
           </section>
         </div>
 
-      </main>
+      </motion.main>
 
       {/* BOTTOM NAVIGATION */}
       <nav className="fixed bottom-0 left-0 w-full z-50">
          <div className="absolute inset-0 bg-black/80 backdrop-blur-2xl border-t border-white/5" />
-         <div className="relative max-w-md mx-auto flex justify-between items-center px-6 py-4">
+         <div className="relative max-w-md mx-auto flex justify-between items-center px-6 pt-4 pb-[env(safe-area-inset-bottom,20px)]">
             <NavIcon 
               icon={<Home />} 
               label={distanceToHome ? `Home • ${distanceToHome}` : "Home"} 
               active={mapMode === 'IDLE' && !isTrustedCircleOpen && !isHiddenSettingsOpen && !isJourneyDrawerOpen} 
-              onClick={() => {
-                setMapMode('IDLE');
-                setIsTrustedCircleOpen(false);
-                setIsHiddenSettingsOpen(false);
-                setIsJourneyDrawerOpen(false);
-                setIsSafeRouteOpen(false);
-              }}
+              onClick={() => navigateTo('IDLE')}
+              tapScale={motionProfile.tapScale}
             />
             <NavIcon 
               icon={<Map />} 
               label={trackingStatus ? `Tracking • ${trackingStatus}` : "Tracking"} 
               active={mapMode === 'TRACKING'}
-              onClick={() => {
-                setMapMode('TRACKING');
-                setIsTrustedCircleOpen(false);
-                setIsHiddenSettingsOpen(false);
-                setIsJourneyDrawerOpen(false);
-                setIsSafeRouteOpen(false);
-              }}
+              onClick={() => navigateTo('TRACKING')}
+              tapScale={motionProfile.tapScale}
             />
-            <div className="-mt-8 relative z-10">
-               <button 
+            <div className="-mt-10 relative z-10">
+               <motion.button 
+                whileTap={{ scale: motionProfile.tapScale }}
                 onPointerDown={startSOS}
-                onPointerUp={abortSOS}
-                onPointerLeave={abortSOS}
+                onPointerUp={cancelSOS}
+                onPointerLeave={cancelSOS}
                 className={`w-16 h-16 rounded-full flex items-center justify-center shadow-[0_0_30px_rgba(220,38,38,0.4)] border-4 border-[#050000] hover:scale-105 transition-all ${sosActive ? 'bg-crimson-glow animate-pulse' : 'bg-crimson-glow'}`}
                >
                   <Shield className="w-7 h-7 text-white" />
-               </button>
+               </motion.button>
             </div>
             <NavIcon 
               icon={<Users />} 
               label="Network" 
               active={isTrustedCircleOpen}
-              onClick={() => {
-                setIsTrustedCircleOpen(true);
-                setIsHiddenSettingsOpen(false);
-                setIsJourneyDrawerOpen(false);
-                setIsSafeRouteOpen(false);
-              }}
+              onClick={() => navigateTo('NETWORK')}
+              tapScale={motionProfile.tapScale}
             />
             <NavIcon 
               icon={<Settings />} 
               label="Settings" 
               active={isHiddenSettingsOpen}
-              onClick={() => {
-                setIsHiddenSettingsOpen(true);
-                setIsTrustedCircleOpen(false);
-                setIsJourneyDrawerOpen(false);
-                setIsSafeRouteOpen(false);
-              }}
+              onClick={() => navigateTo('SETTINGS')}
+              tapScale={motionProfile.tapScale}
             />
          </div>
       </nav>
@@ -1962,24 +2162,32 @@ function DashboardPage() {
               <h2 className="text-lg font-medium text-silver tracking-tight mb-1">Silent Emergency Mode Activated</h2>
               
               {isFetchingLocation ? (
-                <div className="py-4 flex flex-col items-center">
-                  <div className="w-5 h-5 border-2 border-white/20 border-t-white/60 rounded-full animate-spin mb-3" />
-                  <p className="text-[9px] uppercase tracking-widest text-silver/40">Securing location...</p>
+                <div className="py-6 flex flex-col items-center w-full relative z-10">
+                  <div className="w-full max-w-[120px] h-8 glass-skeleton mb-4" />
+                  <p className="text-[9px] uppercase tracking-widest text-silver/40 animate-pulse">Securing satellite link...</p>
                 </div>
               ) : (
-                <div className="text-4xl font-light text-silver/80 my-4 font-mono">
+                <div className="text-4xl font-light text-silver/80 my-4 font-mono relative z-10">
                   {hiddenCountdown}
                 </div>
               )}
 
               {!isFetchingLocation && (
                 <div className="flex gap-3 w-full mt-2">
-                  <button onClick={cancelHiddenEmergency} className="flex-1 py-3 rounded-xl border border-white/10 text-[10px] font-bold uppercase tracking-widest text-silver/60 hover:bg-white/5 hover:text-silver transition-colors">
+                  <motion.button 
+                    whileTap={{ scale: 0.96 }}
+                    onClick={cancelHiddenEmergency} 
+                    className="flex-1 py-3 rounded-xl border border-white/10 text-[10px] font-bold uppercase tracking-widest text-silver/60 hover:bg-white/5 hover:text-silver transition-colors"
+                  >
                     Cancel
-                  </button>
-                  <button onClick={() => activateEmergency("HIDDEN_SOS")} className="flex-1 py-3 rounded-xl bg-white/5 text-silver text-[10px] font-bold uppercase tracking-widest hover:bg-white/10 transition-colors">
+                  </motion.button>
+                  <motion.button 
+                    whileTap={{ scale: 0.96 }}
+                    onClick={() => activateEmergency("HIDDEN_SOS")} 
+                    className="flex-1 py-3 rounded-xl bg-white/5 text-silver text-[10px] font-bold uppercase tracking-widest hover:bg-white/10 transition-colors"
+                  >
                     Confirm
-                  </button>
+                  </motion.button>
                 </div>
               )}
             </motion.div>
@@ -2148,9 +2356,9 @@ function DashboardPage() {
               <p className="text-[10px] text-silver/50 uppercase tracking-widest mb-8 relative z-10">Shake pattern detected. SOS will activate shortly.</p>
 
               {isFetchingLocation ? (
-                <div className="py-8 flex flex-col items-center relative z-10">
-                  <div className="w-8 h-8 border-2 border-crimson-glow border-t-transparent rounded-full animate-spin mb-4" />
-                  <p className="text-[10px] font-bold uppercase tracking-widest text-crimson-glow">Fetching live location...</p>
+                <div className="py-8 flex flex-col items-center relative z-10 w-full">
+                  <div className="w-32 h-16 glass-skeleton mb-6" />
+                  <p className="text-[10px] font-bold uppercase tracking-widest text-crimson-glow animate-pulse">Syncing high-accuracy telemetry...</p>
                 </div>
               ) : (
                 <div className="text-8xl font-light text-crimson-glow mb-8 relative z-10 animate-pulse">
@@ -2160,12 +2368,20 @@ function DashboardPage() {
 
               {!isFetchingLocation && (
                 <div className="flex gap-4 w-full relative z-10">
-                  <button onClick={cancelShakeEmergency} className="flex-1 py-4 rounded-xl border border-white/10 text-[11px] font-bold uppercase tracking-widest text-silver hover:bg-white/5 transition-colors">
+                  <motion.button 
+                    whileTap={{ scale: 0.96 }}
+                    onClick={cancelShakeEmergency} 
+                    className="flex-1 py-4 rounded-2xl border border-white/10 text-[11px] font-bold uppercase tracking-widest text-silver/60 hover:bg-white/5 hover:text-silver transition-colors"
+                  >
                     Cancel
-                  </button>
-                  <button onClick={() => activateEmergency("SHAKE_SOS")} className="flex-1 py-4 rounded-xl bg-crimson-glow text-white text-[11px] font-bold uppercase tracking-widest hover:bg-red-600 transition-colors shadow-[0_0_20px_rgba(220,38,38,0.4)]">
-                    Activate Now
-                  </button>
+                  </motion.button>
+                  <motion.button 
+                    whileTap={{ scale: 0.96 }}
+                    onClick={() => activateEmergency("SHAKE_SOS")} 
+                    className="flex-1 py-4 rounded-2xl bg-crimson-glow text-white text-[11px] font-bold uppercase tracking-widest hover:bg-red-600 transition-colors shadow-lg shadow-red-500/20"
+                  >
+                    Activate
+                  </motion.button>
                 </div>
               )}
             </motion.div>
@@ -2260,9 +2476,10 @@ function DashboardPage() {
 
                 <div className="flex-1 overflow-y-auto space-y-3 pb-8">
                   {isLoadingContacts ? (
-                    <div className="flex flex-col items-center justify-center py-10">
-                       <div className="w-8 h-8 border-2 border-crimson-glow border-t-transparent rounded-full animate-spin mb-4" />
-                       <p className="text-[10px] font-bold uppercase tracking-widest text-silver/40">Loading Contacts...</p>
+                    <div className="space-y-3 py-2">
+                       <Skeleton className="w-full" height="72px" />
+                       <Skeleton className="w-full" height="72px" />
+                       <Skeleton className="w-full" height="72px" />
                     </div>
                   ) : contacts.length === 0 ? (
                     <div className="text-center py-10 border border-dashed border-white/5 rounded-2xl glass-panel bg-white/[0.01]">
@@ -2342,24 +2559,26 @@ function DashboardPage() {
                       <label className="text-[10px] uppercase tracking-widest text-silver/40 mb-2 block">Expected Arrival Time</label>
                       <div className="grid grid-cols-2 gap-3">
                         {[1, 15, 30, 60].map(mins => (
-                          <button 
+                          <motion.button 
                             key={mins}
+                            whileTap={{ scale: 0.94 }}
                             onClick={() => setJourneyDuration(mins)}
                             className={`py-3 rounded-xl border text-[11px] font-bold uppercase tracking-widest transition-colors ${journeyDuration === mins ? 'border-crimson-glow/50 bg-crimson-glow/10 text-crimson-glow' : 'border-white/10 text-silver/60 hover:border-white/30 hover:bg-white/5'}`}
                           >
                             {mins === 60 ? '1 Hour' : `${mins} Mins`}
-                          </button>
+                          </motion.button>
                         ))}
                       </div>
                     </div>
 
-                    <button 
+                    <motion.button 
+                      whileTap={{ scale: 0.98 }}
                       onClick={startJourney}
                       disabled={!journeyDestination}
                       className="w-full mt-4 py-4 rounded-xl bg-white text-black text-[11px] font-bold uppercase tracking-widest hover:bg-silver transition-colors disabled:opacity-50"
                     >
                       Start Safe Journey
-                    </button>
+                    </motion.button>
                     
                     <p className="text-center text-[10px] text-silver/20 leading-relaxed px-4 mt-8">Your trusted circle will be notified if you fail to check in after the ETA.</p>
                   </div>
@@ -2623,26 +2842,32 @@ function DashboardPage() {
         )}
       </AnimatePresence>
 
-      <FakeCallModal 
-        isOpen={isFakeCallSettingsOpen}
-        onClose={() => setIsFakeCallSettingsOpen(false)}
-        enabled={fakeCallEnabled}
-        onToggle={setFakeCallEnabled}
-      />
+      <Suspense fallback={null}>
+        <FakeCallModal 
+          isOpen={isFakeCallSettingsOpen}
+          onClose={() => setIsFakeCallSettingsOpen(false)}
+          enabled={fakeCallEnabled}
+          onToggle={setFakeCallEnabled}
+        />
+      </Suspense>
 
-      <FallDetectionModal 
-        isOpen={isFallDetectionOpen}
-        onClose={() => setIsFallDetectionOpen(false)}
-        enabled={fallDetectionEnabled}
-        onToggle={setFallDetectionEnabled}
-      />
+      <Suspense fallback={null}>
+        <FallDetectionModal 
+          isOpen={isFallDetectionOpen}
+          onClose={() => setIsFallDetectionOpen(false)}
+          enabled={fallDetectionEnabled}
+          onToggle={setFallDetectionEnabled}
+        />
+      </Suspense>
 
-      <MedicalProfileModal 
-        isOpen={isMedicalProfileOpen}
-        onClose={() => setIsMedicalProfileOpen(false)}
-        active={medicalProfileActive}
-        onToggle={setMedicalProfileActive}
-      />
+      <Suspense fallback={null}>
+        <MedicalProfileModal 
+          isOpen={isMedicalProfileOpen}
+          onClose={() => setIsMedicalProfileOpen(false)}
+          active={medicalProfileActive}
+          onToggle={setMedicalProfileActive}
+        />
+      </Suspense>
 
       {/* TACTICAL MAP OVERLAY */}
       <AnimatePresence>
@@ -2656,15 +2881,17 @@ function DashboardPage() {
           >
             {/* FULLSCREEN MAP */}
             <div className="flex-1 relative">
-              <GMap 
-                className="w-full h-full"
-                sosActive={sosActive}
-                destination={structuredDest ? { lat: structuredDest.lat, lng: structuredDest.lng } : undefined}
-                routePoints={mapMode === 'ROUTE' ? routePolyline : null}
-                routeRisk={mapMode === 'ROUTE' ? routeRisk : null}
-                nearbyHelp={mapMode === 'NEARBY' ? nearbyResults : null}
-                onTelemetryUpdate={setCurrentTelemetry}
-              />
+              <LocalizedErrorBoundary>
+                <GMap 
+                  className="w-full h-full"
+                  sosActive={sosActive}
+                  destination={structuredDest ? { lat: structuredDest.lat, lng: structuredDest.lng } : undefined}
+                  routePoints={mapMode === 'ROUTE' ? routePolyline : null}
+                  routeRisk={mapMode === 'ROUTE' ? routeRisk : null}
+                  nearbyHelp={mapMode === 'NEARBY' ? nearbyResults : null}
+                  onTelemetryUpdate={setCurrentTelemetry}
+                />
+              </LocalizedErrorBoundary>
               
               {/* RADAR SCANNING OVERLAY */}
               {isSearchingNearby && (
@@ -3305,7 +3532,7 @@ function DashboardPage() {
 }
 
 // ... unchanged sub-components
-function StatusChip({ label, active }: { label: string, active: boolean }) {
+const StatusChip = React.memo(function StatusChip({ label, active }: { label: string, active: boolean }) {
   return (
     <div className={`px-3 py-1.5 rounded-full border flex items-center gap-2 transition-colors ${
       active ? 'bg-white/5 border-white/10 text-silver' : 'bg-black/50 border-white/5 text-silver/40'
@@ -3314,25 +3541,30 @@ function StatusChip({ label, active }: { label: string, active: boolean }) {
       <span className="text-[10px] uppercase tracking-wider font-medium">{label}</span>
     </div>
   )
-}
+});
 
-function MapButton({ label, primary, onClick }: { label: string, primary?: boolean, onClick?: () => void }) {
+const MapButton = React.memo(function MapButton({ label, primary, onClick, tapScale }: { label: string, primary?: boolean, onClick?: () => void, tapScale?: number }) {
   return (
-    <button 
+    <motion.button 
       onClick={onClick}
+      whileTap={{ scale: tapScale || 0.96 }}
       className={`px-4 py-2.5 rounded-xl text-[10px] font-bold uppercase tracking-widest transition-all backdrop-blur-md pointer-events-auto ${
       primary 
         ? 'bg-crimson-glow text-white hover:bg-red-600 shadow-lg shadow-red-500/20' 
         : 'bg-black/60 border border-white/10 text-silver hover:bg-white/10'
     }`}>
       {label}
-    </button>
+    </motion.button>
   )
-}
+});
 
-function FeatureCard({ title, desc, icon, active, onClick }: { title: string, desc: string, icon: React.ReactNode, active: boolean, onClick?: () => void }) {
+const FeatureCard = React.memo(function FeatureCard({ title, desc, icon, active, onClick, tapScale, pulseOpacity }: { title: string, desc: string, icon: React.ReactNode, active: boolean, onClick?: () => void, tapScale?: number, pulseOpacity?: number }) {
   return (
-    <div onClick={onClick} className="glass-panel p-5 rounded-2xl border-white/5 bg-black/40 hover:bg-white/[0.02] hover:border-white/10 transition-colors group cursor-pointer flex gap-4 items-start">
+    <motion.div 
+      onClick={onClick}
+      whileTap={{ scale: tapScale || 0.98 }}
+      className="glass-panel p-5 rounded-2xl border-white/5 bg-black/40 hover:bg-white/[0.02] hover:border-white/10 transition-colors group cursor-pointer flex gap-4 items-start"
+    >
       <div className={`w-10 h-10 rounded-xl flex items-center justify-center shrink-0 transition-colors ${
         active ? 'bg-crimson-glow/10 text-crimson-glow border border-crimson-glow/20' : 'bg-white/5 text-silver/40 border border-white/5'
       }`}>
@@ -3341,19 +3573,24 @@ function FeatureCard({ title, desc, icon, active, onClick }: { title: string, de
       <div className="flex-1">
         <div className="flex justify-between items-start mb-1">
           <h4 className="text-[13px] font-medium text-silver group-hover:text-white transition-colors">{title}</h4>
-          <div className={`w-2 h-2 rounded-full mt-1.5 ${active ? 'bg-green-500 shadow-[0_0_5px_rgba(34,197,94,0.5)]' : 'bg-silver/20'}`} />
+          <div 
+            className={`w-2 h-2 rounded-full mt-1.5 ${active ? 'bg-green-500 shadow-[0_0_5px_rgba(34,197,94,0.5)]' : 'bg-silver/20'}`} 
+            style={{ opacity: pulseOpacity ?? 1 }}
+          />
         </div>
         <p className="text-[11px] text-silver/40 leading-relaxed">{desc}</p>
       </div>
-    </div>
+    </motion.div>
   )
-}
+});
 
-function ContactRow({ guardian, sosActive }: { guardian: any, sosActive: boolean }) {
+const ContactRow = React.memo(function ContactRow({ guardian, sosActive, tapScale }: { guardian: any, sosActive: boolean, tapScale?: number }) {
   const { name, status, type, distance, acknowledged, responding, eta, priority } = guardian;
   
   return (
-    <div className={`flex items-center justify-between p-4 rounded-xl transition-all duration-500 cursor-pointer ${
+    <motion.div 
+      whileTap={{ scale: tapScale || 0.98 }}
+      className={`flex items-center justify-between p-4 rounded-xl transition-all duration-500 cursor-pointer ${
       sosActive && acknowledged ? 'bg-blue-500/5 border border-blue-500/20' : 
       sosActive ? 'bg-red-500/5 border border-red-500/20 animate-pulse-slow' :
       'hover:bg-white/5 border border-transparent'
@@ -3408,9 +3645,9 @@ function ContactRow({ guardian, sosActive }: { guardian: any, sosActive: boolean
           </div>
         )}
       </div>
-    </div>
+    </motion.div>
   )
-}
+});
 
 function TimelineItem({ label, time, active }: { label: string, time: string, active?: boolean }) {
   return (
@@ -3427,14 +3664,21 @@ function TimelineItem({ label, time, active }: { label: string, time: string, ac
   )
 }
 
-function NavIcon({ icon, label, active, onClick }: { icon: React.ReactNode, label: string, active?: boolean, onClick?: () => void }) {
+const NavIcon = React.memo(function NavIcon({ icon, label, active, onClick, tapScale }: { icon: React.ReactNode, label: string, active?: boolean, onClick?: () => void, tapScale?: number }) {
   return (
-    <div 
+    <motion.div 
       onClick={onClick}
+      whileTap={{ scale: tapScale || 0.95 }}
       className={`flex flex-col items-center gap-1.5 cursor-pointer transition-colors ${active ? 'text-crimson-glow' : 'text-silver/40 hover:text-silver/80'}`}
     >
       <div className="w-5 h-5">{icon}</div>
       <span className="text-[9px] uppercase tracking-widest font-medium">{label}</span>
-    </div>
+    </motion.div>
   )
-}
+});
+
+
+
+export const Route = createFileRoute("/dashboard")({
+  component: DashboardPage,
+});
